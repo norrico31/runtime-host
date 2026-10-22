@@ -1,4 +1,3 @@
-
 mod telemetry;
 
 use std::{
@@ -22,7 +21,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{
     io::TokioIo,
     p2::{
-        bindings::{http::types::Scheme, ProxyPre},
+        bindings::{http::types::{ErrorCode, Scheme}, ProxyPre},
         body::HyperOutgoingBody,
     },
     WasiHttpCtx, WasiHttpCtxView, WasiHttpView,
@@ -32,6 +31,16 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const EPOCH_TICK: Duration = Duration::from_millis(100);
 const WASM_FUEL_BUDGET: u64 = 1_000_000_000;
 const EPOCH_DEADLINE_TICKS: u8 = 40;
+
+fn classify_runtime_error(err: &wasmtime::Error) -> &'static str {
+    match err.downcast_ref::<wasmtime::Trap>() {
+        Some(wasmtime::Trap::OutOfFuel) | Some(wasmtime::Trap::Interrupt) => {
+            "runtime.interrupted"
+        }
+        Some(_) => "runtime.trap",
+        None => "runtime.error",
+    }
+}
 
 struct HostState {
     table: ResourceTable,
@@ -73,8 +82,6 @@ impl Server {
         let started = Instant::now();
         let method = req.method().to_string();
         let path = req.uri().path().to_string();
-
-        // Real, unique identifiers for this request and component instance.
         let request_id = Uuid::new_v4().to_string();
         let instance_id = Uuid::new_v4().to_string();
 
@@ -83,20 +90,14 @@ impl Server {
             &self.component,
             Some(&instance_id),
             Some(&request_id),
-            json!({
-                "method": method,
-                "path": path
-            }),
+            json!({ "method": method, "path": path }),
         );
-
         self.telemetry.record(
             "instance.created",
             &self.component,
             Some(&instance_id),
             Some(&request_id),
-            json!({
-                "creation_reason": "http_request"
-            }),
+            json!({ "creation_reason": "http_request" }),
         );
 
         let mut store = Store::new(
@@ -107,21 +108,15 @@ impl Server {
                 http: WasiHttpCtx::new(),
             },
         );
-
         store.set_fuel(WASM_FUEL_BUDGET)?;
         store.set_epoch_deadline(EPOCH_DEADLINE_TICKS as u64);
 
         let (sender, receiver) = tokio::sync::oneshot::channel();
-
         let incoming = store
             .data_mut()
             .http()
             .new_incoming_request(Scheme::Http, req)?;
-
-        let out = store
-            .data_mut()
-            .http()
-            .new_response_outparam(sender)?;
+        let out = store.data_mut().http().new_response_outparam(sender)?;
 
         let pre = self.pre.clone();
         let telemetry = Arc::clone(&self.telemetry);
@@ -129,10 +124,8 @@ impl Server {
         let task_instance_id = instance_id.clone();
         let task_request_id = request_id.clone();
 
-        // Run the component asynchronously and record its lifecycle.
         let task = tokio::spawn(async move {
             let proxy = pre.instantiate_async(&mut store).await?;
-
             telemetry.record(
                 "instance.ready",
                 &component,
@@ -140,16 +133,13 @@ impl Server {
                 Some(&task_request_id),
                 json!({}),
             );
-
             proxy
                 .wasi_http_incoming_handler()
                 .call_handle(store, incoming, out)
                 .await?;
-
             Ok::<(), wasmtime::Error>(())
         });
 
-        // Wait up to five seconds for the guest to produce a response.
         let received = tokio::time::timeout(REQUEST_TIMEOUT, receiver).await;
 
         match received {
@@ -160,13 +150,7 @@ impl Server {
 
                 println!(
                     "host_observation request_count={} request_id={} instance_id={} method={} path={} status={} duration_us={}",
-                    count,
-                    request_id,
-                    instance_id,
-                    method,
-                    path,
-                    status,
-                    duration_us
+                    count, request_id, instance_id, method, path, status, duration_us
                 );
 
                 self.telemetry.record(
@@ -189,8 +173,7 @@ impl Server {
                     }),
                 );
 
-                // The response body may still be streaming. Watch the guest
-                // task separately instead of blocking the HTTP response.
+                // Response may stream after headers. Watch guest completion separately.
                 let telemetry = Arc::clone(&self.telemetry);
                 let component = self.component.clone();
                 let watcher_instance_id = instance_id.clone();
@@ -200,21 +183,13 @@ impl Server {
                     match task.await {
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => {
-                            let message = err.to_string();
-                            let event_type = if message.to_lowercase().contains("trap") {
-                                "runtime.trap"
-                            } else {
-                                "runtime.error"
-                            };
-
+                            let event_type = classify_runtime_error(&err);
                             telemetry.record(
                                 event_type,
                                 &component,
                                 Some(&watcher_instance_id),
                                 Some(&watcher_request_id),
-                                json!({
-                                    "error": message
-                                }),
+                                json!({ "error": err.to_string() }),
                             );
                         }
                         Err(err) => {
@@ -230,23 +205,22 @@ impl Server {
                             );
                         }
                     }
-
                     telemetry.record(
                         "instance.terminated",
                         &component,
                         Some(&watcher_instance_id),
                         Some(&watcher_request_id),
-                        json!({
-                            "reason": "request_task_finished"
-                        }),
+                        json!({ "reason": "request_task_finished" }),
                     );
                 });
 
                 Ok(response)
             }
 
+            // A response was sent through the WASI HTTP outparam as an error.
             Ok(Ok(Err(err))) => {
-                let message = err.to_string();
+                let message = format!("{err:?}");
+                let event_type = classify_http_error_code(&err);
 
                 self.telemetry.record(
                     "request.failed",
@@ -259,47 +233,35 @@ impl Server {
                         "error": message
                     }),
                 );
-
                 self.telemetry.record(
-                    "runtime.error",
+                    event_type,
                     &self.component,
                     Some(&instance_id),
                     Some(&request_id),
-                    json!({
-                        "error": message
-                    }),
+                    json!({ "error": message }),
                 );
 
                 let _ = task.await;
-
                 self.telemetry.record(
                     "instance.terminated",
                     &self.component,
                     Some(&instance_id),
                     Some(&request_id),
-                    json!({
-                        "reason": "response_error"
-                    }),
+                    json!({ "reason": "response_error" }),
                 );
 
-                Err(err.into())
+                Err(wasmtime::Error::msg(format!("Guest HTTP error: {err:?}")))
             }
 
-            Ok(Err(_)) => {
-                let task_result = task.await;
-
-                let message = match task_result {
-                    Ok(Ok(())) => {
-                        "Guest finished without setting an HTTP response".to_string()
-                    }
-                    Ok(Err(err)) => err.to_string(),
-                    Err(err) => format!("Guest task failed: {err}"),
-                };
-
-                let event_type = if message.to_lowercase().contains("trap") {
-                    "runtime.trap"
-                } else {
-                    "runtime.error"
+            // Guest ended without delivering a response.
+            Ok(Err(_recv_error)) => {
+                let (event_type, message) = match task.await {
+                    Ok(Ok(())) => (
+                        "runtime.error",
+                        "Guest finished without setting an HTTP response".to_string(),
+                    ),
+                    Ok(Err(err)) => (classify_runtime_error(&err), err.to_string()),
+                    Err(err) => ("runtime.error", format!("Guest task failed: {err}")),
                 };
 
                 self.telemetry.record(
@@ -307,11 +269,8 @@ impl Server {
                     &self.component,
                     Some(&instance_id),
                     Some(&request_id),
-                    json!({
-                        "error": message
-                    }),
+                    json!({ "error": message }),
                 );
-
                 self.telemetry.record(
                     "request.failed",
                     &self.component,
@@ -323,25 +282,21 @@ impl Server {
                         "error": message
                     }),
                 );
-
                 self.telemetry.record(
                     "instance.terminated",
                     &self.component,
                     Some(&instance_id),
                     Some(&request_id),
-                    json!({
-                        "reason": "guest_task_failed"
-                    }),
+                    json!({ "reason": "guest_task_failed" }),
                 );
 
                 Err(wasmtime::Error::msg(message))
             }
 
-            Err(_) => {
-                // Abort the guest task when the response timeout expires.
+            // Tokio's wall-clock response timeout expired.
+            Err(_elapsed) => {
                 task.abort();
                 let _ = task.await;
-
                 let duration_us = started.elapsed().as_micros();
 
                 self.telemetry.record(
@@ -353,18 +308,16 @@ impl Server {
                         "method": method,
                         "path": path,
                         "timeout_ms": REQUEST_TIMEOUT.as_millis(),
-                        "duration_us": duration_us
+                        "duration_us": duration_us,
+                        "reason": "wall_clock_timeout"
                     }),
                 );
-
                 self.telemetry.record(
                     "instance.terminated",
                     &self.component,
                     Some(&instance_id),
                     Some(&request_id),
-                    json!({
-                        "reason": "request_timeout"
-                    }),
+                    json!({ "reason": "request_timeout" }),
                 );
 
                 Err(wasmtime::Error::msg("WASM request timed out"))
@@ -373,13 +326,18 @@ impl Server {
     }
 }
 
+/// The WASI HTTP outparam error is an HTTP/WASI ErrorCode, not a Wasmtime trap.
+/// Keep it separate from guest execution traps.
+fn classify_http_error_code(_err: &ErrorCode) -> &'static str {
+    "runtime.error"
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let path = std::env::args().nth(1).unwrap_or_else(|| {
         "../sample-wasi-http-rust/target/wasm32-wasip2/release/sample_wasi_http_rust.wasm"
             .to_string()
     });
-
     let component_name = std::path::Path::new(&path)
         .file_stem()
         .and_then(|name| name.to_str())
@@ -387,10 +345,7 @@ async fn main() -> Result<()> {
         .to_string();
 
     std::fs::create_dir_all("telemetry")?;
-
-    let telemetry = Arc::new(
-        Telemetry::open("telemetry/events.jsonl")?
-    );
+    let telemetry = Arc::new(Telemetry::open("telemetry/events.jsonl")?);
 
     let mut config = wasmtime::Config::new();
     config.consume_fuel(true);
@@ -398,7 +353,6 @@ async fn main() -> Result<()> {
 
     let engine = Engine::new(&config)?;
     let component = Component::from_file(&engine, &path)?;
-
     let mut linker = Linker::new(&engine);
 
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
@@ -426,10 +380,8 @@ async fn main() -> Result<()> {
     });
 
     let epoch_engine = engine.clone();
-
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(EPOCH_TICK);
-
         loop {
             ticker.tick().await;
             epoch_engine.increment_epoch();
@@ -437,7 +389,6 @@ async fn main() -> Result<()> {
     });
 
     let listener = TcpListener::bind("127.0.0.1:8081").await?;
-
     println!("WASM HTTP host listening on http://127.0.0.1:8081");
     println!("Component: {path}");
     println!("Telemetry: telemetry/events.jsonl");
@@ -449,22 +400,15 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |req| {
                 let server = Arc::clone(&server);
-
                 async move {
                     match server.handle(req).await {
-                        Ok(response) => {
-                            Ok::<_, std::io::Error>(response)
-                        }
+                        Ok(response) => Ok::<_, std::io::Error>(response),
                         Err(err) => {
                             eprintln!("component request failed: {err:#}");
-
                             let response = hyper::Response::builder()
-                                .status(
-                                    hyper::StatusCode::INTERNAL_SERVER_ERROR,
-                                )
+                                .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
                                 .body(HyperOutgoingBody::default())
                                 .expect("valid 500 response");
-
                             Ok(response)
                         }
                     }
