@@ -34,9 +34,8 @@ const EPOCH_DEADLINE_TICKS: u8 = 40;
 
 fn classify_runtime_error(err: &wasmtime::Error) -> &'static str {
     match err.downcast_ref::<wasmtime::Trap>() {
-        Some(wasmtime::Trap::OutOfFuel) | Some(wasmtime::Trap::Interrupt) => {
-            "runtime.interrupted"
-        }
+        Some(wasmtime::Trap::Interrupt) => "runtime.epoch_interrupted",
+        Some(wasmtime::Trap::OutOfFuel) => "runtime.fuel_exhausted",
         Some(_) => "runtime.trap",
         None => "runtime.error",
     }
@@ -108,7 +107,6 @@ impl Server {
                 http: WasiHttpCtx::new(),
             },
         );
-        store.set_fuel(WASM_FUEL_BUDGET)?;
         store.set_epoch_deadline(EPOCH_DEADLINE_TICKS as u64);
 
         let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -335,6 +333,8 @@ fn classify_http_error_code(_err: &ErrorCode) -> &'static str {
 #[tokio::main]
 async fn main() -> Result<()> {
     let path = std::env::args().nth(1).unwrap_or_else(|| {
+        // TODO: DYNAMIC ARGS
+        // multiple instance sandboxed
         "../sample-wasi-http-rust/target/wasm32-wasip2/release/sample_wasi_http_rust.wasm"
             .to_string()
     });
@@ -348,7 +348,7 @@ async fn main() -> Result<()> {
     let telemetry = Arc::new(Telemetry::open("telemetry/events.jsonl")?);
 
     let mut config = wasmtime::Config::new();
-    config.consume_fuel(true);
+    //config.consume_fuel(true);
     config.epoch_interruption(true);
 
     let engine = Engine::new(&config)?;
