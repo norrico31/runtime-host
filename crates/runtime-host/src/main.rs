@@ -108,6 +108,7 @@ impl Server {
             },
         );
         store.set_epoch_deadline(EPOCH_DEADLINE_TICKS as u64);
+        store.set_fuel(WASM_FUEL_BUDGET)?;
 
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let incoming = store
@@ -348,7 +349,7 @@ async fn main() -> Result<()> {
     let telemetry = Arc::new(Telemetry::open("telemetry/events.jsonl")?);
 
     let mut config = wasmtime::Config::new();
-    //config.consume_fuel(true);
+    config.consume_fuel(true);
     config.epoch_interruption(true);
 
     let engine = Engine::new(&config)?;
