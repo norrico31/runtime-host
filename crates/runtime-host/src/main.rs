@@ -331,6 +331,19 @@ fn classify_http_error_code(_err: &ErrorCode) -> &'static str {
     "runtime.error"
 }
 
+// resource policy
+#[derive(Debug)]
+pub struct ResourcePolicy {
+    pub fuel_budget: u64,
+    pub epoch_deadline_ticks: u64,
+    pub max_memory_bytes: usize,
+    pub request_timeout: Duration,
+}
+
+pub struct AdmissionPolicy {
+    pub max_concurrent_instances: usize,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let path = std::env::args().nth(1).unwrap_or_else(|| {
