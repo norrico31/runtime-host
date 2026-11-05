@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use net::SocketAddr;
+use std::net::SocketAddr;
 use hyper::server::conn::http1;
 use serde_json::json;
 use telemetry::Telemetry;
@@ -93,7 +93,14 @@ impl Server {
             &self.component,
             Some(&instance_id),
             Some(&request_id),
-            json!({ "method": method, "path": path }),
+            json!({
+                "method": method,
+                "path": path,
+                "source_ip": peer_addr.ip().to_string(),
+                "source_port": peer_addr.port(),
+                "destination_ip": local_addr.ip().to_string(),
+                "destination_port": local_addr.port()
+            }),  
         );
         self.telemetry.record(
             "instance.created",
@@ -340,7 +347,9 @@ async fn serve_listener(
     server: Arc<Server>,
 ) -> Result<()> {
     loop {
-        let (stream, addr) = listener.accept().await?;
+        let local_addr = listener.local_addr()?;
+
+        let (stream, peer_addr) = listener.accept().await?;
         let server = Arc::clone(&server);
 
         tokio::spawn(async move {
@@ -348,7 +357,7 @@ async fn serve_listener(
                 let server = Arc::clone(&server);
 
                 async move {
-                    match server.handle(req).await {
+                    match server.handle(req, peer_addr, local_addr).await {
                         Ok(response) => Ok::<_, std::io::Error>(response),
                         Err(err) => {
                             eprintln!("component request failed: {err:#}");
@@ -368,8 +377,7 @@ async fn serve_listener(
                 .serve_connection(TokioIo::new(stream), service)
                 .await
             {
-                eprintln!("connection {addr} failed: {err}");
-            }
+                eprintln!("connection {peer_addr} failed: {err}");            }
         });
     }
 }
