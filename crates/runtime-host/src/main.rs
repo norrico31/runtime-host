@@ -1,4 +1,5 @@
 mod telemetry;
+mod config;
 
 use std::{
     sync::{
@@ -8,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use net::SocketAddr;
 use hyper::server::conn::http1;
 use serde_json::json;
 use telemetry::Telemetry;
@@ -77,6 +79,8 @@ impl Server {
     async fn handle(
         &self,
         req: hyper::Request<hyper::body::Incoming>,
+        peer_addr: SocketAddr,
+        local_addr: SocketAddr,
     ) -> Result<hyper::Response<HyperOutgoingBody>> {
         let started = Instant::now();
         let method = req.method().to_string();
@@ -331,69 +335,10 @@ fn classify_http_error_code(_err: &ErrorCode) -> &'static str {
     "runtime.error"
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let path = std::env::args().nth(1).unwrap_or_else(|| {
-        // TODO: DYNAMIC ARGS
-        // multiple instance sandboxed
-        "../sample-wasi-http-rust/target/wasm32-wasip2/release/sample_wasi_http_rust.wasm"
-            .to_string()
-    });
-    let component_name = std::path::Path::new(&path)
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or("wasm-component")
-        .to_string();
-
-    std::fs::create_dir_all("telemetry")?;
-    let telemetry = Arc::new(Telemetry::open("telemetry/events.jsonl")?);
-
-    let mut config = wasmtime::Config::new();
-    config.consume_fuel(true);
-    config.epoch_interruption(true);
-
-    let engine = Engine::new(&config)?;
-    let component = Component::from_file(&engine, &path)?;
-    let mut linker = Linker::new(&engine);
-
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
-
-    let pre = ProxyPre::new(linker.instantiate_pre(&component)?)?;
-
-    telemetry.record(
-        "runtime.started",
-        &component_name,
-        None,
-        None,
-        json!({
-            "host": "runtime-host",
-            "wasmtime_version": "50",
-            "component_path": path
-        }),
-    );
-
-    let server = Arc::new(Server {
-        pre,
-        requests: AtomicU64::new(0),
-        telemetry: Arc::clone(&telemetry),
-        component: component_name.clone(),
-    });
-
-    let epoch_engine = engine.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(EPOCH_TICK);
-        loop {
-            ticker.tick().await;
-            epoch_engine.increment_epoch();
-        }
-    });
-
-    let listener = TcpListener::bind("127.0.0.1:8081").await?;
-    println!("WASM HTTP host listening on http://127.0.0.1:8081");
-    println!("Component: {path}");
-    println!("Telemetry: telemetry/events.jsonl");
-
+async fn serve_listener(
+    listener: TcpListener,
+    server: Arc<Server>,
+) -> Result<()> {
     loop {
         let (stream, addr) = listener.accept().await?;
         let server = Arc::clone(&server);
@@ -401,15 +346,18 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |req| {
                 let server = Arc::clone(&server);
+
                 async move {
                     match server.handle(req).await {
                         Ok(response) => Ok::<_, std::io::Error>(response),
                         Err(err) => {
                             eprintln!("component request failed: {err:#}");
+
                             let response = hyper::Response::builder()
                                 .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
                                 .body(HyperOutgoingBody::default())
                                 .expect("valid 500 response");
+
                             Ok(response)
                         }
                     }
@@ -426,3 +374,124 @@ async fn main() -> Result<()> {
     }
 }
 
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "wasm-services.toml".to_string());
+
+    let runtime_config = config::RuntimeConfig::load(&config_path)
+        .map_err(|err| {
+            wasmtime::Error::msg(format!(
+                "Failed to load configuration: {err}"
+            ))
+        })?;
+
+    std::fs::create_dir_all("telemetry")?;
+
+    let telemetry = Arc::new(
+        Telemetry::open("telemetry/events.jsonl")?
+    );
+
+    let mut wasmtime_config = wasmtime::Config::new();
+    wasmtime_config.consume_fuel(true);
+    wasmtime_config.epoch_interruption(true);
+
+    let engine = Engine::new(&wasmtime_config)?;
+
+    let mut services = Vec::new();
+
+    for (service_name, service_config) in runtime_config.services {
+        if !service_config.enabled {
+            continue;
+        }
+
+        let component_path = &service_config.component;
+
+        if !component_path.is_file() {
+            return Err(wasmtime::Error::msg(format!(
+                "Component artifact not found for service '{}': {}",
+                service_name,
+                component_path.display()
+            )));
+        }
+
+        let component = Component::from_file(
+            &engine,
+            component_path,
+        )?;
+
+        let mut linker = Linker::new(&engine);
+
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+        wasmtime_wasi_http::p2::add_only_http_to_linker_async(
+            &mut linker
+        )?;
+
+        let pre = ProxyPre::new(
+            linker.instantiate_pre(&component)?
+        )?;
+
+        let server = Arc::new(Server {
+            pre,
+            requests: AtomicU64::new(0),
+            telemetry: Arc::clone(&telemetry),
+            component: service_name.clone(),
+        });
+
+        let listener = TcpListener::bind((
+            "127.0.0.1",
+            service_config.port,
+        ))
+        .await?;
+
+        telemetry.record(
+            "runtime.started",
+            &service_name,
+            None,
+            None,
+            json!({
+                "host": "runtime-host",
+                "wasmtime_version": "50",
+                "component_path": component_path.display().to_string(),
+                "port": service_config.port
+            }),
+        );
+
+        println!(
+            "Service '{}' listening on http://127.0.0.1:{}",
+            service_name,
+            service_config.port
+        );
+
+        services.push((service_name, listener, server));
+    }
+
+    let epoch_engine = engine.clone();
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(EPOCH_TICK);
+
+        loop {
+            ticker.tick().await;
+            epoch_engine.increment_epoch();
+        }
+    });
+
+    for (service_name, listener, server) in services {
+        tokio::spawn(async move {
+            if let Err(err) = serve_listener(listener, server).await {
+                eprintln!(
+                    "Service '{}' stopped: {err:#}",
+                    service_name
+                );
+            }
+        });
+    }
+
+    println!("Runtime host initialized successfully.");
+
+    std::future::pending::<()>().await;
+
+    Ok(())
+}
