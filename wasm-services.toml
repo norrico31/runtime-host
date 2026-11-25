@@ -21,8 +21,8 @@ component = "../sample-wasi-http-rust/target/wasm32-wasip2/release/sample_wasi_h
 port = 8084
 enabled = true
 
-# [services.notifications]
-# component = "../sample-wasi-http-rust/target/wasm32-wasip2/release/sample_wasi_http_rust.wasm"
-# port = 8085
-# enabled = true
+[services.notifications]
+component = "../sample-wasi-http-rust/target/wasm32-wasip2/release/sample_wasi_http_rust.wasm"
+port = 8085
+enabled = true
 

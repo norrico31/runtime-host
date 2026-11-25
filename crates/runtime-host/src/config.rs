@@ -34,18 +34,39 @@ impl RuntimeConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, Box<dyn Error>> {
         let config_path = path.as_ref();
 
-        let contents = fs::read_to_string(config_path)?;
+        let resolved_config_path = if config_path.is_absolute() {
+            config_path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(config_path)
+        };
+
+        println!(
+            "Loading runtime configuration: {}",
+            resolved_config_path.display()
+        );
+
+        let contents = fs::read_to_string(&resolved_config_path)?;
+
         let mut config: Self = toml::from_str(&contents)?;
 
         config.validate()?;
 
-        let base_dir = config_path
+        let base_dir = resolved_config_path
             .parent()
             .unwrap_or_else(|| Path::new("."));
 
-        for service in config.services.values_mut() {
+        for (service_name, service) in &mut config.services {
             if service.component.is_relative() {
                 service.component = base_dir.join(&service.component);
+            }
+
+            if service.enabled {
+                println!(
+                    "Configured service: name={} port={} component={}",
+                    service_name,
+                    service.port,
+                    service.component.display()
+                );
             }
         }
 
