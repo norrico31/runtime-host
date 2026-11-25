@@ -1,3 +1,4 @@
+mod artifact;
 mod config;
 mod telemetry;
 
@@ -16,7 +17,7 @@ use telemetry::Telemetry;
 use tokio::net::TcpListener;
 use wasmtime::{
     Engine, Result, Store,
-    component::{Component, Linker, ResourceTable},
+    component::{Linker, ResourceTable},
 };
 
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
@@ -110,6 +111,7 @@ impl Server {
                 "destination_port": local_addr.port()
             }),
         );
+
         self.telemetry.record(
             "instance.created",
             &self.component,
@@ -126,14 +128,17 @@ impl Server {
                 http: WasiHttpCtx::new(),
             },
         );
+
         store.set_epoch_deadline(EPOCH_DEADLINE_TICKS as u64);
         store.set_fuel(WASM_FUEL_BUDGET)?;
 
         let (sender, receiver) = tokio::sync::oneshot::channel();
+
         let incoming = store
             .data_mut()
             .http()
             .new_incoming_request(Scheme::Http, req)?;
+
         let out = store.data_mut().http().new_response_outparam(sender)?;
 
         let pre = self.pre.clone();
@@ -144,6 +149,7 @@ impl Server {
 
         let task = tokio::spawn(async move {
             let proxy = pre.instantiate_async(&mut store).await?;
+
             telemetry.record(
                 "instance.ready",
                 &component,
@@ -151,10 +157,12 @@ impl Server {
                 Some(&task_request_id),
                 json!({}),
             );
+
             proxy
                 .wasi_http_incoming_handler()
                 .call_handle(store, incoming, out)
                 .await?;
+
             Ok::<(), wasmtime::Error>(())
         });
 
@@ -191,7 +199,9 @@ impl Server {
                     }),
                 );
 
-                // Response may stream after headers. Watch guest completion separately.
+                // Response may stream after headers.
+                // Watch guest completion separately.
+
                 let telemetry = Arc::clone(&self.telemetry);
                 let component = self.component.clone();
                 let watcher_instance_id = instance_id.clone();
@@ -200,8 +210,10 @@ impl Server {
                 tokio::spawn(async move {
                     match task.await {
                         Ok(Ok(())) => {}
+
                         Ok(Err(err)) => {
                             let event_type = classify_runtime_error(&err);
+
                             telemetry.record(
                                 event_type,
                                 &component,
@@ -210,6 +222,7 @@ impl Server {
                                 json!({ "error": err.to_string() }),
                             );
                         }
+
                         Err(err) => {
                             telemetry.record(
                                 "runtime.error",
@@ -223,6 +236,7 @@ impl Server {
                             );
                         }
                     }
+
                     telemetry.record(
                         "instance.terminated",
                         &component,
@@ -251,6 +265,7 @@ impl Server {
                         "error": message
                     }),
                 );
+
                 self.telemetry.record(
                     event_type,
                     &self.component,
@@ -260,6 +275,7 @@ impl Server {
                 );
 
                 let _ = task.await;
+
                 self.telemetry.record(
                     "instance.terminated",
                     &self.component,
@@ -278,7 +294,9 @@ impl Server {
                         "runtime.error",
                         "Guest finished without setting an HTTP response".to_string(),
                     ),
+
                     Ok(Err(err)) => (classify_runtime_error(&err), err.to_string()),
+
                     Err(err) => ("runtime.error", format!("Guest task failed: {err}")),
                 };
 
@@ -289,6 +307,7 @@ impl Server {
                     Some(&request_id),
                     json!({ "error": message }),
                 );
+
                 self.telemetry.record(
                     "request.failed",
                     &self.component,
@@ -300,6 +319,7 @@ impl Server {
                         "error": message
                     }),
                 );
+
                 self.telemetry.record(
                     "instance.terminated",
                     &self.component,
@@ -315,6 +335,7 @@ impl Server {
             Err(_elapsed) => {
                 task.abort();
                 let _ = task.await;
+
                 let duration_us = started.elapsed().as_micros();
 
                 self.telemetry.record(
@@ -330,6 +351,7 @@ impl Server {
                         "reason": "wall_clock_timeout"
                     }),
                 );
+
                 self.telemetry.record(
                     "instance.terminated",
                     &self.component,
@@ -344,8 +366,8 @@ impl Server {
     }
 }
 
-/// The WASI HTTP outparam error is an HTTP/WASI ErrorCode, not a Wasmtime trap.
-/// Keep it separate from guest execution traps.
+/// The WASI HTTP outparam error is an HTTP/WASI ErrorCode,
+/// not a Wasmtime trap.
 fn classify_http_error_code(_err: &ErrorCode) -> &'static str {
     "runtime.error"
 }
@@ -364,6 +386,7 @@ async fn serve_listener(listener: TcpListener, server: Arc<Server>) -> Result<()
                 async move {
                     match server.handle(req, peer_addr, local_addr).await {
                         Ok(response) => Ok::<_, std::io::Error>(response),
+
                         Err(err) => {
                             eprintln!("component request failed: {err:#}");
 
@@ -390,6 +413,10 @@ async fn serve_listener(listener: TcpListener, server: Arc<Server>) -> Result<()
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ==========================================
+    // PHASE 1: LOAD RUNTIME CONFIGURATION
+    // ==========================================
+
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "wasm-services.toml".to_string());
@@ -397,41 +424,74 @@ async fn main() -> Result<()> {
     let runtime_config = config::RuntimeConfig::load(&config_path)
         .map_err(|err| wasmtime::Error::msg(format!("Failed to load configuration: {err}")))?;
 
+    println!("Runtime configuration loaded successfully.");
+
+    // ==========================================
+    // PHASE 2: INITIALIZE TELEMETRY
+    // ==========================================
+
     std::fs::create_dir_all("telemetry")?;
 
     let telemetry = Arc::new(Telemetry::open("telemetry/events.jsonl")?);
 
+    // ==========================================
+    // PHASE 3: INITIALIZE WASMTIME ENGINE
+    // ==========================================
+
     let mut wasmtime_config = wasmtime::Config::new();
+
     wasmtime_config.consume_fuel(true);
     wasmtime_config.epoch_interruption(true);
 
     let engine = Engine::new(&wasmtime_config)?;
 
-    let mut services = Vec::new();
+    println!("Wasmtime engine initialized successfully.");
 
-    for (service_name, service_config) in runtime_config.services {
-        if !service_config.enabled {
-            continue;
-        }
+    // ==========================================
+    // PHASE 4: COMPONENT ARTIFACT PREFLIGHT
+    // ==========================================
 
-        let component_path = &service_config.component;
+    // Validate all enabled component artifacts before
+    // initializing any service listener.
 
-        if !component_path.is_file() {
-            return Err(wasmtime::Error::msg(format!(
-                "Component artifact not found for service '{}': {}",
-                service_name,
-                component_path.display()
-            )));
-        }
+    let preflighted_services = artifact::preflight_components(&engine, &runtime_config)?;
 
-        let component = Component::from_file(&engine, component_path)?;
+    println!(
+        "Artifact preflight passed for {} service(s).",
+        preflighted_services.len()
+    );
+
+    // ==========================================
+    // PHASE 5: SERVICE INITIALIZATION
+    // ==========================================
+
+    // This is the single service collection used by
+    // the runtime for listener registration.
+
+    let mut services: Vec<(String, TcpListener, Arc<Server>)> =
+        Vec::with_capacity(preflighted_services.len());
+
+    for preflighted in preflighted_services {
+        let service_name = preflighted.service_name;
+        let component_path = preflighted.component_path;
+        let component = preflighted.component;
+        let port = preflighted.port;
+
+        println!("Preparing service: name={} port={}", service_name, port);
+
+        // Create service-specific linker.
 
         let mut linker = Linker::new(&engine);
 
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
 
+        // Prepare component instantiation.
+
         let pre = ProxyPre::new(linker.instantiate_pre(&component)?)?;
+
+        // Initialize service server.
 
         let server = Arc::new(Server {
             pre,
@@ -441,7 +501,11 @@ async fn main() -> Result<()> {
             component: service_name.clone(),
         });
 
-        let listener = TcpListener::bind(("127.0.0.1", service_config.port)).await?;
+        // Bind service listener.
+
+        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+
+        // Record service initialization.
 
         telemetry.record(
             "runtime.started",
@@ -452,17 +516,23 @@ async fn main() -> Result<()> {
                 "host": "runtime-host",
                 "wasmtime_version": "50",
                 "component_path": component_path.display().to_string(),
-                "port": service_config.port
+                "port": port
             }),
         );
 
         println!(
             "Service '{}' listening on http://127.0.0.1:{}",
-            service_name, service_config.port
+            service_name, port
         );
+
+        // Register initialized service.
 
         services.push((service_name, listener, server));
     }
+
+    // ==========================================
+    // PHASE 6: START WASMTIME EPOCH INTERRUPTIONS
+    // ==========================================
 
     let epoch_engine = engine.clone();
 
@@ -475,6 +545,10 @@ async fn main() -> Result<()> {
         }
     });
 
+    // ==========================================
+    // PHASE 7: START SERVICE LISTENERS
+    // ==========================================
+
     for (service_name, listener, server) in services {
         tokio::spawn(async move {
             if let Err(err) = serve_listener(listener, server).await {
@@ -483,7 +557,21 @@ async fn main() -> Result<()> {
         });
     }
 
+    // ==========================================
+    // PHASE 8: RUNTIME READY
+    // ==========================================
+
+    println!("==========================================");
     println!("Runtime host initialized successfully.");
+    println!(
+        "Active services: {}",
+        runtime_config
+            .services
+            .values()
+            .filter(|service| service.enabled)
+            .count()
+    );
+    println!("==========================================");
 
     std::future::pending::<()>().await;
 
