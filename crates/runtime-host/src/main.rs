@@ -19,6 +19,7 @@ use wasmtime::{
     component::{Component, Linker, ResourceTable},
     Engine, Result, Store,
 };
+
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{
     io::TokioIo,
