@@ -6,23 +6,47 @@ component = "../sample-wasi-http-rust/target/wasm32-wasip2/release/sample_wasi_h
 port = 8081
 enabled = true
 
+[services.users.build]
+manifest = "../sample-wasi-http-rust/Cargo.toml"
+target = "wasm32-wasip2"
+profile = "release"
+
 [services.products]
 component = "../sample-wasi-http-rust/target/wasm32-wasip2/release/sample_wasi_http_rust.wasm"
 port = 8082
 enabled = true
+
+[services.products.build]
+manifest = "../sample-wasi-http-rust/Cargo.toml"
+target = "wasm32-wasip2"
+profile = "release"
 
 [services.orders]
 component = "../sample-wasi-http-rust/target/wasm32-wasip2/release/sample_wasi_http_rust.wasm"
 port = 8083
 enabled = true
 
+[services.orders.build]
+manifest = "../sample-wasi-http-rust/Cargo.toml"
+target = "wasm32-wasip2"
+profile = "release"
+
 [services.payments]
 component = "../sample-wasi-http-rust/target/wasm32-wasip2/release/sample_wasi_http_rust.wasm"
 port = 8084
 enabled = true
+
+[services.payments.build]
+manifest = "../sample-wasi-http-rust/Cargo.toml"
+target = "wasm32-wasip2"
+profile = "release"
 
 [services.notifications]
 component = "../sample-wasi-http-rust/target/wasm32-wasip2/release/sample_wasi_http_rust.wasm"
 port = 8085
 enabled = true
 
+[services.notifications.build]
+manifest = "../sample-wasi-http-rust/Cargo.toml"
+target = "wasm32-wasip2"
+profile = "release"

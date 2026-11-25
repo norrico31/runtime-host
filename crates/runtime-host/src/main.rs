@@ -435,7 +435,13 @@ async fn main() -> Result<()> {
     println!("Wasmtime engine initialized successfully.");
 
     // ---------------------------------------------------------
-    // PHASE 1: COMPONENT ARTIFACT PREFLIGHT
+    // PHASE 1: HOST-MANAGED ARTIFACT BUILD
+    // ---------------------------------------------------------
+
+    artifact::build_configured_artifacts(&runtime_config)?;
+
+    // ---------------------------------------------------------
+    // PHASE 2: COMPONENT ARTIFACT PREFLIGHT
     // ---------------------------------------------------------
 
     let preflighted_services = artifact::preflight_components(&engine, &runtime_config)?;
@@ -446,7 +452,7 @@ async fn main() -> Result<()> {
     );
 
     // ---------------------------------------------------------
-    // PHASE 2: COMPONENT LINKER PREFLIGHT
+    // PHASE 3: COMPONENT LINKER PREFLIGHT
     // ---------------------------------------------------------
 
     println!("Starting component linker preflight...");
@@ -512,7 +518,7 @@ async fn main() -> Result<()> {
     );
 
     // ---------------------------------------------------------
-    // PHASE 3: SERVICE PREPARATION AND LISTENER BINDING
+    // PHASE 4: SERVICE PREPARATION AND LISTENER BINDING
     // ---------------------------------------------------------
 
     let mut services: Vec<(String, TcpListener, Arc<Server>)> =
@@ -553,7 +559,7 @@ async fn main() -> Result<()> {
     }
 
     // ---------------------------------------------------------
-    // PHASE 4: START RUNTIME EPOCH TICKER
+    // PHASE 5: START RUNTIME EPOCH TICKER
     // ---------------------------------------------------------
 
     let epoch_engine = engine.clone();
@@ -568,7 +574,7 @@ async fn main() -> Result<()> {
     });
 
     // ---------------------------------------------------------
-    // PHASE 5: START SERVICE LISTENERS
+    // PHASE 6: START SERVICE LISTENERS
     // ---------------------------------------------------------
 
     for (service_name, listener, server) in services {
