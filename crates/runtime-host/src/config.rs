@@ -1,4 +1,3 @@
-
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -74,13 +73,12 @@ impl RuntimeConfig {
     }
 
     fn validate(&self) -> Result<(), Box<dyn Error>> {
-        if self.runtime.max_services == 0
-            || self.runtime.max_services > MAX_ALLOWED_SERVICES
-        {
+        if self.runtime.max_services == 0 || self.runtime.max_services > MAX_ALLOWED_SERVICES {
             return Err("max_services must be between 1 and 5".into());
         }
 
-        let enabled: Vec<_> = self.services
+        let enabled: Vec<_> = self
+            .services
             .values()
             .filter(|service| service.enabled)
             .collect();
@@ -101,14 +99,10 @@ impl RuntimeConfig {
             }
 
             if !ports.insert(service.port) {
-                return Err(format!(
-                    "Duplicate service port: {}",
-                    service.port
-                ).into());
+                return Err(format!("Duplicate service port: {}", service.port).into());
             }
         }
 
         Ok(())
     }
 }
-

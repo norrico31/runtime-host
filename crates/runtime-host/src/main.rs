@@ -1,32 +1,35 @@
-mod telemetry;
 mod config;
+mod telemetry;
 
 use std::{
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
-use std::net::SocketAddr;
 use hyper::server::conn::http1;
 use serde_json::json;
+use std::net::SocketAddr;
 use telemetry::Telemetry;
 use tokio::net::TcpListener;
 use wasmtime::{
-    component::{Component, Linker, ResourceTable},
     Engine, Result, Store,
+    component::{Component, Linker, ResourceTable},
 };
 
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{
+    WasiHttpCtx, WasiHttpCtxView, WasiHttpView,
     io::TokioIo,
     p2::{
-        bindings::{http::types::{ErrorCode, Scheme}, ProxyPre},
+        bindings::{
+            ProxyPre,
+            http::types::{ErrorCode, Scheme},
+        },
         body::HyperOutgoingBody,
     },
-    WasiHttpCtx, WasiHttpCtxView, WasiHttpView,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -93,7 +96,6 @@ impl Server {
         let request_id = format!("{}-req-{request_sequence:06}", self.component);
         let instance_id = format!("{}-inst-{instance_sequence:06}", self.component);
 
-
         self.telemetry.record(
             "request.started",
             &self.component,
@@ -106,7 +108,7 @@ impl Server {
                 "source_port": peer_addr.port(),
                 "destination_ip": local_addr.ip().to_string(),
                 "destination_port": local_addr.port()
-            }),  
+            }),
         );
         self.telemetry.record(
             "instance.created",
@@ -348,10 +350,7 @@ fn classify_http_error_code(_err: &ErrorCode) -> &'static str {
     "runtime.error"
 }
 
-async fn serve_listener(
-    listener: TcpListener,
-    server: Arc<Server>,
-) -> Result<()> {
+async fn serve_listener(listener: TcpListener, server: Arc<Server>) -> Result<()> {
     loop {
         let local_addr = listener.local_addr()?;
 
@@ -383,7 +382,8 @@ async fn serve_listener(
                 .serve_connection(TokioIo::new(stream), service)
                 .await
             {
-                eprintln!("connection {peer_addr} failed: {err}");            }
+                eprintln!("connection {peer_addr} failed: {err}");
+            }
         });
     }
 }
@@ -395,17 +395,11 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "wasm-services.toml".to_string());
 
     let runtime_config = config::RuntimeConfig::load(&config_path)
-        .map_err(|err| {
-            wasmtime::Error::msg(format!(
-                "Failed to load configuration: {err}"
-            ))
-        })?;
+        .map_err(|err| wasmtime::Error::msg(format!("Failed to load configuration: {err}")))?;
 
     std::fs::create_dir_all("telemetry")?;
 
-    let telemetry = Arc::new(
-        Telemetry::open("telemetry/events.jsonl")?
-    );
+    let telemetry = Arc::new(Telemetry::open("telemetry/events.jsonl")?);
 
     let mut wasmtime_config = wasmtime::Config::new();
     wasmtime_config.consume_fuel(true);
@@ -430,21 +424,14 @@ async fn main() -> Result<()> {
             )));
         }
 
-        let component = Component::from_file(
-            &engine,
-            component_path,
-        )?;
+        let component = Component::from_file(&engine, component_path)?;
 
         let mut linker = Linker::new(&engine);
 
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-        wasmtime_wasi_http::p2::add_only_http_to_linker_async(
-            &mut linker
-        )?;
+        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
 
-        let pre = ProxyPre::new(
-            linker.instantiate_pre(&component)?
-        )?;
+        let pre = ProxyPre::new(linker.instantiate_pre(&component)?)?;
 
         let server = Arc::new(Server {
             pre,
@@ -454,11 +441,7 @@ async fn main() -> Result<()> {
             component: service_name.clone(),
         });
 
-        let listener = TcpListener::bind((
-            "127.0.0.1",
-            service_config.port,
-        ))
-        .await?;
+        let listener = TcpListener::bind(("127.0.0.1", service_config.port)).await?;
 
         telemetry.record(
             "runtime.started",
@@ -475,8 +458,7 @@ async fn main() -> Result<()> {
 
         println!(
             "Service '{}' listening on http://127.0.0.1:{}",
-            service_name,
-            service_config.port
+            service_name, service_config.port
         );
 
         services.push((service_name, listener, server));
@@ -496,10 +478,7 @@ async fn main() -> Result<()> {
     for (service_name, listener, server) in services {
         tokio::spawn(async move {
             if let Err(err) = serve_listener(listener, server).await {
-                eprintln!(
-                    "Service '{}' stopped: {err:#}",
-                    service_name
-                );
+                eprintln!("Service '{}' stopped: {err:#}", service_name);
             }
         });
     }
