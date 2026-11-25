@@ -3,12 +3,14 @@ use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io::{self, Write},
     path::Path,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
 };
-use uuid::Uuid;
 
 #[derive(Debug, Serialize)]
 pub struct ObservationEvent {
@@ -22,7 +24,8 @@ pub struct ObservationEvent {
 }
 
 pub struct Telemetry {
-    file: Mutex<std::fs::File>,
+    file: Mutex<File>,
+    event_sequence: AtomicU64,
 }
 
 impl Telemetry {
@@ -38,6 +41,7 @@ impl Telemetry {
 
         Ok(Self {
             file: Mutex::new(file),
+            event_sequence: AtomicU64::new(1),
         })
     }
 
@@ -49,8 +53,10 @@ impl Telemetry {
         request_id: Option<&str>,
         attributes: Value,
     ) {
+        let sequence = self.event_sequence.fetch_add(1, Ordering::Relaxed);
+
         let event = ObservationEvent {
-            event_id: Uuid::new_v4().to_string(),
+            event_id: format!("evt-{sequence:06}"),
             timestamp: Utc::now()
                 .to_rfc3339_opts(SecondsFormat::Micros, true),
             event_type: event_type.to_string(),

@@ -14,7 +14,6 @@ use hyper::server::conn::http1;
 use serde_json::json;
 use telemetry::Telemetry;
 use tokio::net::TcpListener;
-use uuid::Uuid;
 use wasmtime::{
     component::{Component, Linker, ResourceTable},
     Engine, Result, Store,
@@ -72,6 +71,7 @@ impl WasiHttpView for HostState {
 struct Server {
     pre: ProxyPre<HostState>,
     requests: AtomicU64,
+    id_sequence: AtomicU64,
     telemetry: Arc<Telemetry>,
     component: String,
 }
@@ -86,8 +86,13 @@ impl Server {
         let started = Instant::now();
         let method = req.method().to_string();
         let path = req.uri().path().to_string();
-        let request_id = Uuid::new_v4().to_string();
-        let instance_id = Uuid::new_v4().to_string();
+
+        let request_sequence = self.id_sequence.fetch_add(1, Ordering::Relaxed);
+        let instance_sequence = self.id_sequence.fetch_add(1, Ordering::Relaxed);
+
+        let request_id = format!("{}-req-{request_sequence:06}", self.component);
+        let instance_id = format!("{}-inst-{instance_sequence:06}", self.component);
+
 
         self.telemetry.record(
             "request.started",
@@ -444,6 +449,7 @@ async fn main() -> Result<()> {
         let server = Arc::new(Server {
             pre,
             requests: AtomicU64::new(0),
+            id_sequence: AtomicU64::new(1),
             telemetry: Arc::clone(&telemetry),
             component: service_name.clone(),
         });
