@@ -45,7 +45,6 @@ impl RuntimeConfig {
         );
 
         let contents = fs::read_to_string(&resolved_config_path)?;
-
         let mut config: Self = toml::from_str(&contents)?;
 
         config.validate()?;
@@ -77,6 +76,16 @@ impl RuntimeConfig {
             return Err("max_services must be between 1 and 5".into());
         }
 
+        if self.services.is_empty() {
+            return Err("At least one service must be configured".into());
+        }
+
+        for service_name in self.services.keys() {
+            if service_name.trim().is_empty() {
+                return Err("Service name cannot be empty".into());
+            }
+        }
+
         let enabled: Vec<_> = self
             .services
             .values()
@@ -93,7 +102,7 @@ impl RuntimeConfig {
 
         let mut ports = HashSet::new();
 
-        for service in &enabled {
+        for service in enabled {
             if service.port == 0 {
                 return Err("Service port cannot be zero".into());
             }
@@ -104,5 +113,247 @@ impl RuntimeConfig {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn valid_config() -> &'static str {
+        r#"
+[runtime]
+max_services = 2
+
+[services.users]
+component = "users.wasm"
+port = 8081
+enabled = true
+
+[services.orders]
+component = "orders.wasm"
+port = 8082
+enabled = true
+"#
+    }
+
+    fn parse_config(contents: &str) -> Result<RuntimeConfig, Box<dyn Error>> {
+        let config: RuntimeConfig = toml::from_str(contents)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn create_test_dir() -> PathBuf {
+        let id = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        let path = std::env::temp_dir().join(format!(
+            "runtime-host-config-test-{}-{}",
+            std::process::id(),
+            id
+        ));
+
+        fs::create_dir_all(&path).expect("failed to create test directory");
+        path
+    }
+
+    #[test]
+    fn accepts_valid_configuration() {
+        assert!(parse_config(valid_config()).is_ok());
+    }
+
+    #[test]
+    fn accepts_five_enabled_services() {
+        let contents = r#"
+[runtime]
+max_services = 5
+
+[services.one]
+component = "one.wasm"
+port = 8001
+enabled = true
+
+[services.two]
+component = "two.wasm"
+port = 8002
+enabled = true
+
+[services.three]
+component = "three.wasm"
+port = 8003
+enabled = true
+
+[services.four]
+component = "four.wasm"
+port = 8004
+enabled = true
+
+[services.five]
+component = "five.wasm"
+port = 8005
+enabled = true
+"#;
+
+        assert!(parse_config(contents).is_ok());
+    }
+
+    #[test]
+    fn ignores_commented_out_service_and_port_entries() {
+        let contents = r#"
+[runtime]
+max_services = 1
+
+[services.users]
+component = "users.wasm"
+port = 8081
+# port = 000
+
+# [services.orders]
+# component = "orders.wasm"
+# port = 8082
+# enabled = true
+
+enabled = true
+"#;
+
+        let config = parse_config(contents).expect("configuration should be valid");
+
+        assert_eq!(config.services.len(), 1);
+        assert_eq!(config.services["users"].port, 8081);
+        assert!(config.services["users"].enabled);
+    }
+
+    #[test]
+    fn rejects_zero_max_services() {
+        let contents = valid_config().replace("max_services = 2", "max_services = 0");
+
+        assert!(parse_config(&contents).is_err());
+    }
+
+    #[test]
+    fn rejects_max_services_above_limit() {
+        let contents = valid_config().replace("max_services = 2", "max_services = 6");
+
+        assert!(parse_config(&contents).is_err());
+    }
+
+    #[test]
+    fn rejects_enabled_services_above_limit() {
+        let contents = valid_config().replace("max_services = 2", "max_services = 1");
+
+        assert!(parse_config(&contents).is_err());
+    }
+
+    #[test]
+    fn rejects_configuration_without_enabled_services() {
+        let contents = valid_config().replace("enabled = true", "enabled = false");
+
+        assert!(parse_config(&contents).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_service_port() {
+        let contents = valid_config().replace("port = 8081", "port = 0");
+
+        assert!(parse_config(&contents).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_enabled_service_ports() {
+        let contents = valid_config().replace("port = 8082", "port = 8081");
+
+        assert!(parse_config(&contents).is_err());
+    }
+
+    #[test]
+    fn ignores_duplicate_ports_on_disabled_services() {
+        let contents = r#"
+[runtime]
+max_services = 1
+
+[services.users]
+component = "users.wasm"
+port = 8081
+enabled = true
+
+[services.orders]
+component = "orders.wasm"
+port = 8081
+enabled = false
+"#;
+
+        assert!(parse_config(contents).is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_service_name() {
+        let contents = r#"
+[runtime]
+max_services = 1
+
+[services]
+"" = { component = "users.wasm", port = 8081, enabled = true }
+"#;
+
+        assert!(parse_config(contents).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_root_field() {
+        let contents = format!("unknown = true\n{}", valid_config());
+
+        assert!(parse_config(&contents).is_err());
+    }
+    #[test]
+    fn rejects_unknown_runtime_field() {
+        let contents =
+            valid_config().replace("max_services = 2", "max_services = 2\nunknown = true");
+
+        assert!(parse_config(&contents).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_service_field() {
+        let contents = valid_config().replace("enabled = true", "enabled = true\nunknown = true");
+
+        assert!(parse_config(&contents).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_required_field() {
+        let contents = valid_config().replace("port = 8081\n", "");
+
+        assert!(parse_config(&contents).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_toml() {
+        let contents = "[runtime\nmax_services = 2";
+
+        assert!(parse_config(contents).is_err());
+    }
+
+    #[test]
+    fn resolves_relative_component_paths_from_config_directory() {
+        let test_dir = create_test_dir();
+        let config_path = test_dir.join("wasm-services.toml");
+
+        fs::write(&config_path, valid_config()).expect("failed to write test configuration");
+
+        let config = RuntimeConfig::load(&config_path).expect("configuration should load");
+
+        assert_eq!(
+            config.services["users"].component,
+            test_dir.join("users.wasm")
+        );
+
+        assert_eq!(
+            config.services["orders"].component,
+            test_dir.join("orders.wasm")
+        );
+
+        fs::remove_dir_all(&test_dir).expect("failed to remove test directory");
     }
 }
