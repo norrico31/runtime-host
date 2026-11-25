@@ -1,3 +1,4 @@
+
 mod artifact;
 mod config;
 mod telemetry;
@@ -10,7 +11,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-
+use std::io::Read;
 use hyper::server::conn::http1;
 use serde_json::json;
 use std::net::SocketAddr;
@@ -79,6 +80,7 @@ struct Server {
     id_sequence: AtomicU64,
     telemetry: Arc<Telemetry>,
     component: String,
+    internal_token: Arc<String>,
 }
 
 impl Server {
@@ -88,6 +90,21 @@ impl Server {
         peer_addr: SocketAddr,
         local_addr: SocketAddr,
     ) -> Result<hyper::Response<HyperOutgoingBody>> {
+
+        // GATEWAY ACCESS ENFORCEMENT
+        let provided_token = req.headers()
+            .get("x-runtime-internal-token")
+            .and_then(|value| value.to_str().ok());
+
+        if provided_token != Some(self.internal_token.as_str()) {
+            return Ok(
+                hyper::Response::builder()
+                    .status(hyper::StatusCode::FORBIDDEN)
+                    .body(HyperOutgoingBody::default())
+                    .expect("valid 403 response")
+            );
+        }
+
         let started = Instant::now();
         let method = req.method().to_string();
         let path = req.uri().path().to_string();
@@ -200,9 +217,6 @@ impl Server {
                     }),
                 );
 
-                // Response may stream after headers.
-                // Watch guest completion separately.
-
                 let telemetry = Arc::clone(&self.telemetry);
                 let component = self.component.clone();
                 let watcher_instance_id = instance_id.clone();
@@ -250,7 +264,6 @@ impl Server {
                 Ok(response)
             }
 
-            // A response was sent through the WASI HTTP outparam as an error.
             Ok(Ok(Err(err))) => {
                 let message = format!("{err:?}");
                 let event_type = classify_http_error_code(&err);
@@ -288,7 +301,6 @@ impl Server {
                 Err(wasmtime::Error::msg(format!("Guest HTTP error: {err:?}")))
             }
 
-            // Guest ended without delivering a response.
             Ok(Err(_recv_error)) => {
                 let (event_type, message) = match task.await {
                     Ok(Ok(())) => (
@@ -332,7 +344,6 @@ impl Server {
                 Err(wasmtime::Error::msg(message))
             }
 
-            // Tokio's wall-clock response timeout expired.
             Err(_elapsed) => {
                 task.abort();
                 let _ = task.await;
@@ -367,8 +378,6 @@ impl Server {
     }
 }
 
-/// The WASI HTTP outparam error is an HTTP/WASI ErrorCode,
-/// not a Wasmtime trap.
 fn classify_http_error_code(_err: &ErrorCode) -> &'static str {
     "runtime.error"
 }
@@ -376,7 +385,6 @@ fn classify_http_error_code(_err: &ErrorCode) -> &'static str {
 async fn serve_listener(listener: TcpListener, server: Arc<Server>) -> Result<()> {
     loop {
         let local_addr = listener.local_addr()?;
-
         let (stream, peer_addr) = listener.accept().await?;
         let server = Arc::clone(&server);
 
@@ -427,6 +435,20 @@ async fn main() -> Result<()> {
 
     let telemetry = Arc::new(Telemetry::open("telemetry/events.jsonl")?);
 
+    // INITIALIZE INTERNAL SERVICE ACCESS TOKEN ONCE
+    let mut token_bytes = [0u8; 32];
+
+    std::fs::File::open("/dev/urandom")?
+        .read_exact(&mut token_bytes)?;
+
+    let internal_token = Arc::new(
+        token_bytes.iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+
+    println!("Internal service access token initialized.");
+
     let mut wasmtime_config = wasmtime::Config::new();
     wasmtime_config.consume_fuel(true);
     wasmtime_config.epoch_interruption(true);
@@ -435,16 +457,10 @@ async fn main() -> Result<()> {
 
     println!("Wasmtime engine initialized successfully.");
 
-    // ---------------------------------------------------------
     // PHASE 1: HOST-MANAGED ARTIFACT BUILD
-    // ---------------------------------------------------------
-
     artifact::build_configured_artifacts(&runtime_config)?;
 
-    // ---------------------------------------------------------
     // PHASE 2: COMPONENT ARTIFACT PREFLIGHT
-    // ---------------------------------------------------------
-
     let preflighted_services = artifact::preflight_components(&engine, &runtime_config)?;
 
     println!(
@@ -452,10 +468,7 @@ async fn main() -> Result<()> {
         preflighted_services.len()
     );
 
-    // ---------------------------------------------------------
     // PHASE 3: COMPONENT LINKER PREFLIGHT
-    // ---------------------------------------------------------
-
     println!("Starting component linker preflight...");
 
     let mut prepared_services = Vec::with_capacity(preflighted_services.len());
@@ -471,7 +484,7 @@ async fn main() -> Result<()> {
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|err| {
             wasmtime::Error::msg(format!(
                 "Component linker preflight failed for service '{}': \
-                    unable to register WASI interfaces: {}",
+                unable to register WASI interfaces: {}",
                 service.service_name, err
             ))
         })?;
@@ -487,7 +500,7 @@ async fn main() -> Result<()> {
         let instance_pre = linker.instantiate_pre(&service.component).map_err(|err| {
             wasmtime::Error::msg(format!(
                 "Component linker preflight failed for service '{}': \
-                    component imports are incompatible with the host linker: {}",
+                component imports are incompatible with the host linker: {}",
                 service.service_name, err
             ))
         })?;
@@ -518,10 +531,7 @@ async fn main() -> Result<()> {
         prepared_services.len()
     );
 
-    // ---------------------------------------------------------
     // PHASE 4: SERVICE PREPARATION AND LISTENER BINDING
-    // ---------------------------------------------------------
-
     let mut services: Vec<(String, TcpListener, Arc<Server>)> =
         Vec::with_capacity(prepared_services.len());
 
@@ -534,6 +544,7 @@ async fn main() -> Result<()> {
             id_sequence: AtomicU64::new(1),
             telemetry: Arc::clone(&telemetry),
             component: service_name.clone(),
+            internal_token: Arc::clone(&internal_token),
         });
 
         let listener = TcpListener::bind(("127.0.0.1", port)).await?;
@@ -559,10 +570,7 @@ async fn main() -> Result<()> {
         services.push((service_name, listener, server));
     }
 
-    // ---------------------------------------------------------
     // PHASE 4.1: DEFAULT GATEWAY INITIALIZATION
-    // ---------------------------------------------------------
-
     let gateway_listener = if let Some(gateway_config) = &runtime_config.gateway {
         if gateway_config.enabled {
             let mut routes = std::collections::BTreeMap::new();
@@ -576,7 +584,10 @@ async fn main() -> Result<()> {
                 }
             }
 
-            let gateway = gateway::Gateway::new(routes)?;
+            let gateway = gateway::Gateway::new(
+                routes,
+                Arc::clone(&internal_token),
+            )?;
 
             let listener = TcpListener::bind((
                 gateway_config.host.as_str(),
@@ -600,10 +611,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    // ---------------------------------------------------------
     // PHASE 5: START RUNTIME EPOCH TICKER
-    // ---------------------------------------------------------
-
     let epoch_engine = engine.clone();
 
     tokio::spawn(async move {
@@ -615,10 +623,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ---------------------------------------------------------
     // PHASE 6: START SERVICE LISTENERS
-    // ---------------------------------------------------------
-
     for (service_name, listener, server) in services {
         tokio::spawn(async move {
             if let Err(err) = serve_listener(listener, server).await {
@@ -627,10 +632,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ---------------------------------------------------------
     // PHASE 6.1: START DEFAULT GATEWAY
-    // ---------------------------------------------------------
-
     if let Some((gateway, listener)) = gateway_listener {
         tokio::spawn(async move {
             if let Err(err) = gateway::serve(gateway, listener).await {
@@ -654,3 +656,4 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+

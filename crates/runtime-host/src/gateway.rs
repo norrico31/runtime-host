@@ -22,11 +22,14 @@ use wasmtime_wasi_http::io::TokioIo;
 pub struct Gateway {
     routes: Arc<BTreeMap<String, u16>>,
     client: reqwest::Client,
+    internal_token: Arc<String>,
 }
 
 impl Gateway {
-    pub fn new(routes: BTreeMap<String, u16>) -> Result<Self> {
-        let client = reqwest::Client::builder()
+    pub fn new(
+        routes: BTreeMap<String, u16>,
+        internal_token: Arc<String>,
+    ) -> Result<Self> {        let client = reqwest::Client::builder()
             .build()
             .map_err(|err| {
                 wasmtime::Error::msg(
@@ -37,6 +40,7 @@ impl Gateway {
         Ok(Self {
             routes: Arc::new(routes),
             client,
+            internal_token,
         })
     }
 
@@ -87,6 +91,10 @@ impl Gateway {
 
         let mut forwarded = self.client
             .request(method, forwarded_uri)
+            .header(
+                "x-runtime-internal-token",
+                self.internal_token.as_str(),
+            )
             .body(body);
 
         for (name, value) in &headers {
