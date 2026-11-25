@@ -413,33 +413,20 @@ async fn serve_listener(listener: TcpListener, server: Arc<Server>) -> Result<()
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // ==========================================
-    // PHASE 1: LOAD RUNTIME CONFIGURATION
-    // ==========================================
-
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "wasm-services.toml".to_string());
 
+    println!("Loading runtime configuration: {}", config_path);
+
     let runtime_config = config::RuntimeConfig::load(&config_path)
         .map_err(|err| wasmtime::Error::msg(format!("Failed to load configuration: {err}")))?;
-
-    println!("Runtime configuration loaded successfully.");
-
-    // ==========================================
-    // PHASE 2: INITIALIZE TELEMETRY
-    // ==========================================
 
     std::fs::create_dir_all("telemetry")?;
 
     let telemetry = Arc::new(Telemetry::open("telemetry/events.jsonl")?);
 
-    // ==========================================
-    // PHASE 3: INITIALIZE WASMTIME ENGINE
-    // ==========================================
-
     let mut wasmtime_config = wasmtime::Config::new();
-
     wasmtime_config.consume_fuel(true);
     wasmtime_config.epoch_interruption(true);
 
@@ -447,12 +434,9 @@ async fn main() -> Result<()> {
 
     println!("Wasmtime engine initialized successfully.");
 
-    // ==========================================
-    // PHASE 4: COMPONENT ARTIFACT PREFLIGHT
-    // ==========================================
-
-    // Validate all enabled component artifacts before
-    // initializing any service listener.
+    // ---------------------------------------------------------
+    // PHASE 1: COMPONENT ARTIFACT PREFLIGHT
+    // ---------------------------------------------------------
 
     let preflighted_services = artifact::preflight_components(&engine, &runtime_config)?;
 
@@ -461,37 +445,81 @@ async fn main() -> Result<()> {
         preflighted_services.len()
     );
 
-    // ==========================================
-    // PHASE 5: SERVICE INITIALIZATION
-    // ==========================================
+    // ---------------------------------------------------------
+    // PHASE 2: COMPONENT LINKER PREFLIGHT
+    // ---------------------------------------------------------
 
-    // This is the single service collection used by
-    // the runtime for listener registration.
+    println!("Starting component linker preflight...");
 
-    let mut services: Vec<(String, TcpListener, Arc<Server>)> =
-        Vec::with_capacity(preflighted_services.len());
+    let mut prepared_services = Vec::with_capacity(preflighted_services.len());
 
-    for preflighted in preflighted_services {
-        let service_name = preflighted.service_name;
-        let component_path = preflighted.component_path;
-        let component = preflighted.component;
-        let port = preflighted.port;
-
-        println!("Preparing service: name={} port={}", service_name, port);
-
-        // Create service-specific linker.
+    for service in preflighted_services {
+        println!(
+            "Checking component linker compatibility: service={}",
+            service.service_name
+        );
 
         let mut linker = Linker::new(&engine);
 
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|err| {
+            wasmtime::Error::msg(format!(
+                "Component linker preflight failed for service '{}': \
+                    unable to register WASI interfaces: {}",
+                service.service_name, err
+            ))
+        })?;
 
-        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
+        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).map_err(|err| {
+            wasmtime::Error::msg(format!(
+                "Component linker preflight failed for service '{}': \
+                unable to register WASI HTTP interfaces: {}",
+                service.service_name, err
+            ))
+        })?;
 
-        // Prepare component instantiation.
+        let instance_pre = linker.instantiate_pre(&service.component).map_err(|err| {
+            wasmtime::Error::msg(format!(
+                "Component linker preflight failed for service '{}': \
+                    component imports are incompatible with the host linker: {}",
+                service.service_name, err
+            ))
+        })?;
 
-        let pre = ProxyPre::new(linker.instantiate_pre(&component)?)?;
+        let pre = ProxyPre::new(instance_pre).map_err(|err| {
+            wasmtime::Error::msg(format!(
+                "Component linker preflight failed for service '{}': {}",
+                service.service_name, err
+            ))
+        })?;
 
-        // Initialize service server.
+        println!(
+            "Component linker preflight passed: service={}",
+            service.service_name
+        );
+
+        prepared_services.push((
+            service.service_name,
+            service.component_path,
+            service.port,
+            pre,
+        ));
+    }
+
+    println!(
+        "Component linker preflight completed successfully: \
+        {} service(s) validated.",
+        prepared_services.len()
+    );
+
+    // ---------------------------------------------------------
+    // PHASE 3: SERVICE PREPARATION AND LISTENER BINDING
+    // ---------------------------------------------------------
+
+    let mut services: Vec<(String, TcpListener, Arc<Server>)> =
+        Vec::with_capacity(prepared_services.len());
+
+    for (service_name, component_path, port, pre) in prepared_services {
+        println!("Preparing service: name={} port={}", service_name, port);
 
         let server = Arc::new(Server {
             pre,
@@ -501,11 +529,7 @@ async fn main() -> Result<()> {
             component: service_name.clone(),
         });
 
-        // Bind service listener.
-
         let listener = TcpListener::bind(("127.0.0.1", port)).await?;
-
-        // Record service initialization.
 
         telemetry.record(
             "runtime.started",
@@ -525,14 +549,12 @@ async fn main() -> Result<()> {
             service_name, port
         );
 
-        // Register initialized service.
-
         services.push((service_name, listener, server));
     }
 
-    // ==========================================
-    // PHASE 6: START WASMTIME EPOCH INTERRUPTIONS
-    // ==========================================
+    // ---------------------------------------------------------
+    // PHASE 4: START RUNTIME EPOCH TICKER
+    // ---------------------------------------------------------
 
     let epoch_engine = engine.clone();
 
@@ -545,9 +567,9 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ==========================================
-    // PHASE 7: START SERVICE LISTENERS
-    // ==========================================
+    // ---------------------------------------------------------
+    // PHASE 5: START SERVICE LISTENERS
+    // ---------------------------------------------------------
 
     for (service_name, listener, server) in services {
         tokio::spawn(async move {
@@ -557,20 +579,15 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ==========================================
-    // PHASE 8: RUNTIME READY
-    // ==========================================
+    let active_services = runtime_config
+        .services
+        .values()
+        .filter(|service| service.enabled)
+        .count();
 
     println!("==========================================");
     println!("Runtime host initialized successfully.");
-    println!(
-        "Active services: {}",
-        runtime_config
-            .services
-            .values()
-            .filter(|service| service.enabled)
-            .count()
-    );
+    println!("Active services: {}", active_services);
     println!("==========================================");
 
     std::future::pending::<()>().await;
