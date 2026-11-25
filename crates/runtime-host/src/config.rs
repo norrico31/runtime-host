@@ -16,10 +16,42 @@ fn default_profile() -> String {
     "release".to_string()
 }
 
+
+fn default_gateway_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_gateway_port() -> u16 {
+    8080
+}
+
+fn default_gateway_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayConfig {
+    #[serde(default = "default_gateway_host")]
+    pub host: String,
+
+    #[serde(default = "default_gateway_port")]
+    pub port: u16,
+
+    #[serde(default = "default_gateway_enabled")]
+    pub enabled: bool,
+}
+
+
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     pub runtime: RuntimeSettings,
+
+    #[serde(default)]
+    pub gateway: Option<GatewayConfig>,
+
     pub services: BTreeMap<String, ServiceConfig>,
 }
 
@@ -123,6 +155,18 @@ impl RuntimeConfig {
     }
 
     fn validate(&self) -> Result<(), Box<dyn Error>> {
+        if let Some(gateway) = &self.gateway {
+            if gateway.enabled {
+                if gateway.host.trim().is_empty() {
+                    return Err("Gateway host cannot be empty".into());
+                }
+
+                if gateway.port == 0 {
+                    return Err("Gateway port cannot be zero".into());
+                }
+            }
+        }
+
         if self.runtime.max_services == 0 || self.runtime.max_services > MAX_ALLOWED_SERVICES {
             return Err("max_services must be between 1 and 5".into());
         }
@@ -178,6 +222,15 @@ impl RuntimeConfig {
         }
 
         let mut ports = HashSet::new();
+
+        if let Some(gateway) = &self.gateway {
+            if gateway.enabled && !ports.insert(gateway.port) {
+                return Err(
+                    format!("Gateway port conflicts with a service port: {}", gateway.port)
+                        .into()
+                );
+            }
+        }
 
         for service in enabled {
             if service.port == 0 {

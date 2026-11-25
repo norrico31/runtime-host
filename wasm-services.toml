@@ -1,6 +1,11 @@
 [runtime]
 max_services = 5
 
+[gateway]
+host = "127.0.0.1"
+port = 8080
+enabled = true
+
 [services.users]
 component = "../sample-wasi-http-rust/target/wasm32-wasip2/release/sample_wasi_http_rust.wasm"
 port = 8081

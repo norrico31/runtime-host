@@ -1,6 +1,7 @@
 mod artifact;
 mod config;
 mod telemetry;
+mod gateway;
 
 use std::{
     sync::{
@@ -559,6 +560,47 @@ async fn main() -> Result<()> {
     }
 
     // ---------------------------------------------------------
+    // PHASE 4.1: DEFAULT GATEWAY INITIALIZATION
+    // ---------------------------------------------------------
+
+    let gateway_listener = if let Some(gateway_config) = &runtime_config.gateway {
+        if gateway_config.enabled {
+            let mut routes = std::collections::BTreeMap::new();
+
+            for (service_name, service_config) in &runtime_config.services {
+                if service_config.enabled {
+                    routes.insert(
+                        service_name.clone(),
+                        service_config.port,
+                    );
+                }
+            }
+
+            let gateway = gateway::Gateway::new(routes)?;
+
+            let listener = TcpListener::bind((
+                gateway_config.host.as_str(),
+                gateway_config.port,
+            ))
+            .await?;
+
+            println!(
+                "Default gateway listening on http://{}:{}",
+                gateway_config.host,
+                gateway_config.port
+            );
+
+            Some((gateway, listener))
+        } else {
+            println!("Default gateway is disabled.");
+            None
+        }
+    } else {
+        println!("Gateway configuration not found. Gateway disabled.");
+        None
+    };
+
+    // ---------------------------------------------------------
     // PHASE 5: START RUNTIME EPOCH TICKER
     // ---------------------------------------------------------
 
@@ -581,6 +623,18 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             if let Err(err) = serve_listener(listener, server).await {
                 eprintln!("Service '{}' stopped: {err:#}", service_name);
+            }
+        });
+    }
+
+    // ---------------------------------------------------------
+    // PHASE 6.1: START DEFAULT GATEWAY
+    // ---------------------------------------------------------
+
+    if let Some((gateway, listener)) = gateway_listener {
+        tokio::spawn(async move {
+            if let Err(err) = gateway::serve(gateway, listener).await {
+                eprintln!("Default gateway stopped: {err:#}");
             }
         });
     }
