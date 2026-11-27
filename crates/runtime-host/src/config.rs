@@ -1,20 +1,11 @@
+
 use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     error::Error,
     fs,
     path::{Path, PathBuf},
 };
-
-const MAX_ALLOWED_SERVICES: usize = 5;
-
-fn default_target() -> String {
-    "wasm32-wasip2".to_string()
-}
-
-fn default_profile() -> String {
-    "release".to_string()
-}
 
 fn default_gateway_host() -> String {
     "127.0.0.1".to_string()
@@ -26,6 +17,49 @@ fn default_gateway_port() -> u16 {
 
 fn default_gateway_enabled() -> bool {
     true
+}
+
+fn default_max_instances() -> usize {
+    100
+}
+
+fn default_instances() -> usize {
+    1
+}
+
+fn default_memory_limit() -> u64 {
+    256 * 1024 * 1024
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Architecture {
+    Monolithic,
+    Microservices,
+    Hybrid,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadKind {
+    Monolith,
+    Service,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub enum BuildDriver {
+    Cargo,
+    Command,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentConfig {
+    pub architecture: Architecture,
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,42 +77,57 @@ pub struct GatewayConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RuntimeSettings {
+    #[serde(default = "default_max_instances")]
+    pub max_instances: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
+    pub deployment: DeploymentConfig,
     pub runtime: RuntimeSettings,
 
     #[serde(default)]
     pub gateway: Option<GatewayConfig>,
 
-    pub services: BTreeMap<String, ServiceConfig>,
+    pub workloads: BTreeMap<String, WorkloadConfig>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RuntimeSettings {
-    pub max_services: usize,
-}
+pub struct WorkloadConfig {
+    pub kind: WorkloadKind,
+    pub repository: PathBuf,
+    pub artifact: PathBuf,
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServiceConfig {
-    pub component: PathBuf,
-    pub port: u16,
+    #[serde(default = "default_enabled")]
     pub enabled: bool,
+
+    #[serde(default = "default_instances")]
+    pub instances: usize,
 
     #[serde(default)]
     pub build: Option<BuildConfig>,
+
+    #[serde(default)]
+    pub resources: ResourceConfig,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuildConfig {
-    pub manifest: PathBuf,
+    pub driver: BuildDriver,
 
-    #[serde(default = "default_target")]
-    pub target: String,
+    // Cargo-specific options.
+    #[serde(default)]
+    pub manifest: Option<PathBuf>,
 
-    #[serde(default = "default_profile")]
-    pub profile: String,
+    #[serde(default)]
+    pub target: Option<String>,
+
+    #[serde(default)]
+    pub profile: Option<String>,
 
     #[serde(default)]
     pub package: Option<String>,
@@ -91,6 +140,28 @@ pub struct BuildConfig {
 
     #[serde(default)]
     pub locked: bool,
+
+    // Generic command-driver options.
+    #[serde(default)]
+    pub command: Option<String>,
+
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceConfig {
+    #[serde(default = "default_memory_limit")]
+    pub memory_limit: u64,
+}
+
+impl Default for ResourceConfig {
+    fn default() -> Self {
+        Self {
+            memory_limit: default_memory_limit(),
+        }
+    }
 }
 
 impl RuntimeConfig {
@@ -111,47 +182,54 @@ impl RuntimeConfig {
         let contents = fs::read_to_string(&resolved_config_path)?;
         let mut config: Self = toml::from_str(&contents)?;
 
-        config.validate()?;
-
         let base_dir = resolved_config_path
             .parent()
             .unwrap_or_else(|| Path::new("."));
 
-        for (service_name, service) in &mut config.services {
-            if service.component.is_relative() {
-                service.component = base_dir.join(&service.component);
+        // Resolve all repository, artifact, and manifest paths relative
+        // to the configuration file or its repository.
+        for (name, workload) in &mut config.workloads {
+            if workload.repository.is_relative() {
+                workload.repository = base_dir.join(&workload.repository);
             }
 
-            if let Some(build) = &mut service.build {
-                if build.manifest.is_relative() {
-                    build.manifest = base_dir.join(&build.manifest);
+            if workload.artifact.is_relative() {
+                workload.artifact = workload.repository.join(&workload.artifact);
+            }
+
+            if let Some(build) = &mut workload.build {
+                if let Some(manifest) = &mut build.manifest {
+                    if manifest.is_relative() {
+                        *manifest = workload.repository.join(&*manifest);
+                    }
                 }
             }
 
-            if service.enabled {
+            if workload.enabled {
                 println!(
-                    "Configured service: name={} port={} component={}",
-                    service_name,
-                    service.port,
-                    service.component.display()
+                    "Configured workload: name={} kind={:?} repository={} artifact={} instances={}",
+                    name,
+                    workload.kind,
+                    workload.repository.display(),
+                    workload.artifact.display(),
+                    workload.instances
                 );
-
-                if let Some(build) = &service.build {
-                    println!(
-                        "Configured build: service={} manifest={} target={} profile={}",
-                        service_name,
-                        build.manifest.display(),
-                        build.target,
-                        build.profile
-                    );
-                }
             }
         }
 
+        config.validate()?;
         Ok(config)
     }
 
-    fn validate(&self) -> Result<(), Box<dyn Error>> {
+    pub fn validate(&self) -> Result<(), Box<dyn Error>> {
+        if self.runtime.max_instances == 0 {
+            return Err("runtime.max_instances must be greater than zero".into());
+        }
+
+        if self.workloads.is_empty() {
+            return Err("At least one workload must be configured".into());
+        }
+
         if let Some(gateway) = &self.gateway {
             if gateway.enabled {
                 if gateway.host.trim().is_empty() {
@@ -164,79 +242,107 @@ impl RuntimeConfig {
             }
         }
 
-        if self.runtime.max_services == 0 || self.runtime.max_services > MAX_ALLOWED_SERVICES {
-            return Err("max_services must be between 1 and 5".into());
-        }
+        let mut enabled_count = 0usize;
+        let mut monolith_count = 0usize;
+        let mut service_count = 0usize;
 
-        if self.services.is_empty() {
-            return Err("At least one service must be configured".into());
-        }
-
-        for (service_name, service) in &self.services {
-            if service_name.trim().is_empty() {
-                return Err("Service name cannot be empty".into());
+        for (name, workload) in &self.workloads {
+            if name.trim().is_empty() {
+                return Err("Workload name cannot be empty".into());
             }
 
-            if let Some(build) = &service.build {
-                if build.manifest.as_os_str().is_empty() {
-                    return Err(format!(
-                        "Build manifest cannot be empty for service '{}'",
-                        service_name
-                    )
-                    .into());
-                }
+            if !workload.enabled {
+                continue;
+            }
 
-                if build.target.trim().is_empty() {
-                    return Err(format!(
-                        "Build target cannot be empty for service '{}'",
-                        service_name
-                    )
-                    .into());
-                }
+            enabled_count += 1;
 
-                if build.profile.trim().is_empty() {
-                    return Err(format!(
-                        "Build profile cannot be empty for service '{}'",
-                        service_name
-                    )
-                    .into());
+            if workload.repository.as_os_str().is_empty() {
+                return Err(format!("Repository cannot be empty for workload '{name}'").into());
+            }
+
+            if workload.artifact.as_os_str().is_empty() {
+                return Err(format!("Artifact path cannot be empty for workload '{name}'").into());
+            }
+
+            if workload.instances == 0 {
+                return Err(format!("Instances must be greater than zero for workload '{name}'").into());
+            }
+
+            if workload.resources.memory_limit == 0 {
+                return Err(format!("Memory limit must be greater than zero for workload '{name}'").into());
+            }
+
+            match workload.kind {
+                WorkloadKind::Monolith => monolith_count += 1,
+                WorkloadKind::Service => service_count += 1,
+            }
+
+            if let Some(build) = &workload.build {
+                match build.driver {
+                    BuildDriver::Cargo => {
+                        if build.manifest.is_none() {
+                            return Err(format!(
+                                "Cargo build requires 'manifest' for workload '{name}'"
+                            ).into());
+                        }
+
+                        if build.command.is_some() {
+                            return Err(format!(
+                                "Cargo workload '{name}' cannot define 'command'"
+                            ).into());
+                        }
+                    }
+                    BuildDriver::Command => {
+                        if build.command.as_deref().unwrap_or("").trim().is_empty() {
+                            return Err(format!(
+                                "Command build requires a non-empty 'command' for workload '{name}'"
+                            ).into());
+                        }
+                    }
                 }
             }
         }
 
-        let enabled: Vec<_> = self
-            .services
+        if enabled_count == 0 {
+            return Err("At least one workload must be enabled".into());
+        }
+
+        let total_instances: usize = self
+            .workloads
             .values()
-            .filter(|service| service.enabled)
-            .collect();
+            .filter(|workload| workload.enabled)
+            .map(|workload| workload.instances)
+            .sum();
 
-        if enabled.is_empty() {
-            return Err("At least one service must be enabled".into());
+        if total_instances > self.runtime.max_instances {
+            return Err(format!(
+                "Configured instance count ({total_instances}) exceeds runtime.max_instances ({})",
+                self.runtime.max_instances
+            ).into());
         }
 
-        if enabled.len() > self.runtime.max_services {
-            return Err("Enabled services exceed max_services".into());
-        }
-
-        let mut ports = HashSet::new();
-
-        if let Some(gateway) = &self.gateway {
-            if gateway.enabled && !ports.insert(gateway.port) {
-                return Err(format!(
-                    "Gateway port conflicts with a service port: {}",
-                    gateway.port
-                )
-                .into());
+        match self.deployment.architecture {
+            Architecture::Monolithic => {
+                if monolith_count == 0 || service_count > 0 {
+                    return Err(
+                        "Monolithic architecture requires monolith workloads only".into()
+                    );
+                }
             }
-        }
-
-        for service in enabled {
-            if service.port == 0 {
-                return Err("Service port cannot be zero".into());
+            Architecture::Microservices => {
+                if service_count == 0 || monolith_count > 0 {
+                    return Err(
+                        "Microservices architecture requires service workloads only".into()
+                    );
+                }
             }
-
-            if !ports.insert(service.port) {
-                return Err(format!("Duplicate service port: {}", service.port).into());
+            Architecture::Hybrid => {
+                if monolith_count == 0 || service_count == 0 {
+                    return Err(
+                        "Hybrid architecture requires at least one monolith and one service workload".into()
+                    );
+                }
             }
         }
 
@@ -247,285 +353,85 @@ impl RuntimeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn valid_config() -> &'static str {
         r#"
+[deployment]
+architecture = "microservices"
+
 [runtime]
-max_services = 2
+max_instances = 100
 
-[services.users]
-component = "users.wasm"
-port = 8081
+[workloads.users]
+kind = "service"
+repository = "../users"
+artifact = "build/users.wasm"
 enabled = true
+instances = 10
 
-[services.orders]
-component = "orders.wasm"
-port = 8082
-enabled = true
-"#
-    }
-
-    fn parse_config(contents: &str) -> Result<RuntimeConfig, Box<dyn Error>> {
-        let config: RuntimeConfig = toml::from_str(contents)?;
-        config.validate()?;
-        Ok(config)
-    }
-
-    fn create_test_dir() -> PathBuf {
-        let id = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-
-        let path = std::env::temp_dir().join(format!(
-            "runtime-host-config-test-{}-{}",
-            std::process::id(),
-            id
-        ));
-
-        fs::create_dir_all(&path).expect("failed to create test directory");
-        path
-    }
-
-    #[test]
-    fn accepts_valid_configuration() {
-        assert!(parse_config(valid_config()).is_ok());
-    }
-
-    #[test]
-    fn accepts_five_enabled_services() {
-        let contents = r#"
-[runtime]
-max_services = 5
-
-[services.one]
-component = "one.wasm"
-port = 8001
-enabled = true
-
-[services.two]
-component = "two.wasm"
-port = 8002
-enabled = true
-
-[services.three]
-component = "three.wasm"
-port = 8003
-enabled = true
-
-[services.four]
-component = "four.wasm"
-port = 8004
-enabled = true
-
-[services.five]
-component = "five.wasm"
-port = 8005
-enabled = true
-"#;
-
-        assert!(parse_config(contents).is_ok());
-    }
-
-    #[test]
-    fn accepts_build_configuration() {
-        let contents = r#"
-[runtime]
-max_services = 1
-
-[services.users]
-component = "users.wasm"
-port = 8081
-enabled = true
-
-[services.users.build]
+[workloads.users.build]
+driver = "cargo"
 manifest = "Cargo.toml"
 target = "wasm32-wasip2"
 profile = "release"
-"#;
 
-        let config = parse_config(contents).expect("build config should be valid");
-        let build = config.services["users"].build.as_ref().unwrap();
-
-        assert_eq!(build.target, "wasm32-wasip2");
-        assert_eq!(build.profile, "release");
+[workloads.users.resources]
+memory_limit = 268435456
+"#
     }
 
     #[test]
-    fn ignores_commented_out_service_and_port_entries() {
+    fn accepts_valid_microservices_configuration() {
+        let config: RuntimeConfig = toml::from_str(valid_config()).unwrap();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_max_instances() {
+        let contents = valid_config().replace("max_instances = 100", "max_instances = 0");
+        let config: RuntimeConfig = toml::from_str(&contents).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_instance_count_above_limit() {
+        let contents = valid_config()
+            .replace("max_instances = 100", "max_instances = 5");
+        let config: RuntimeConfig = toml::from_str(&contents).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_missing_cargo_manifest() {
+        let contents = valid_config().replace("manifest = \"Cargo.toml\"\n", "");
+        let config: RuntimeConfig = toml::from_str(&contents).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_hybrid_architecture() {
         let contents = r#"
+[deployment]
+architecture = "hybrid"
+
 [runtime]
-max_services = 1
+max_instances = 10
 
-[services.users]
-component = "users.wasm"
-port = 8081
-# port = 000
+[workloads.main]
+kind = "monolith"
+repository = "../main"
+artifact = "main.wasm"
+instances = 1
 
-# [services.orders]
-# component = "orders.wasm"
-# port = 8082
-# enabled = true
-
-enabled = true
+[workloads.api]
+kind = "service"
+repository = "../api"
+artifact = "api.wasm"
+instances = 2
 "#;
 
-        let config = parse_config(contents).expect("configuration should be valid");
-
-        assert_eq!(config.services.len(), 1);
-        assert_eq!(config.services["users"].port, 8081);
-        assert!(config.services["users"].enabled);
-    }
-
-    #[test]
-    fn rejects_zero_max_services() {
-        let contents = valid_config().replace("max_services = 2", "max_services = 0");
-        assert!(parse_config(&contents).is_err());
-    }
-
-    #[test]
-    fn rejects_max_services_above_limit() {
-        let contents = valid_config().replace("max_services = 2", "max_services = 6");
-        assert!(parse_config(&contents).is_err());
-    }
-
-    #[test]
-    fn rejects_enabled_services_above_limit() {
-        let contents = valid_config().replace("max_services = 2", "max_services = 1");
-        assert!(parse_config(&contents).is_err());
-    }
-
-    #[test]
-    fn rejects_configuration_without_enabled_services() {
-        let contents = valid_config().replace("enabled = true", "enabled = false");
-        assert!(parse_config(&contents).is_err());
-    }
-
-    #[test]
-    fn rejects_zero_service_port() {
-        let contents = valid_config().replace("port = 8081", "port = 0");
-        assert!(parse_config(&contents).is_err());
-    }
-
-    #[test]
-    fn rejects_duplicate_enabled_service_ports() {
-        let contents = valid_config().replace("port = 8082", "port = 8081");
-        assert!(parse_config(&contents).is_err());
-    }
-
-    #[test]
-    fn ignores_duplicate_ports_on_disabled_services() {
-        let contents = r#"
-[runtime]
-max_services = 1
-
-[services.users]
-component = "users.wasm"
-port = 8081
-enabled = true
-
-[services.orders]
-component = "orders.wasm"
-port = 8081
-enabled = false
-"#;
-
-        assert!(parse_config(contents).is_ok());
-    }
-
-    #[test]
-    fn rejects_empty_service_name() {
-        let contents = r#"
-[runtime]
-max_services = 1
-
-[services]
-"" = { component = "users.wasm", port = 8081, enabled = true }
-"#;
-
-        assert!(parse_config(contents).is_err());
-    }
-
-    #[test]
-    fn rejects_unknown_root_field() {
-        let contents = format!("unknown = true\n{}", valid_config());
-        assert!(parse_config(&contents).is_err());
-    }
-
-    #[test]
-    fn rejects_unknown_runtime_field() {
-        let contents =
-            valid_config().replace("max_services = 2", "max_services = 2\nunknown = true");
-        assert!(parse_config(&contents).is_err());
-    }
-
-    #[test]
-    fn rejects_unknown_service_field() {
-        let contents = valid_config().replace("enabled = true", "enabled = true\nunknown = true");
-        assert!(parse_config(&contents).is_err());
-    }
-
-    #[test]
-    fn rejects_missing_required_field() {
-        let contents = valid_config().replace("port = 8081\n", "");
-        assert!(parse_config(&contents).is_err());
-    }
-
-    #[test]
-    fn rejects_invalid_toml() {
-        let contents = "[runtime\nmax_services = 2";
-        assert!(parse_config(contents).is_err());
-    }
-
-    #[test]
-    fn resolves_relative_component_paths_from_config_directory() {
-        let test_dir = create_test_dir();
-        let config_path = test_dir.join("wasm-services.toml");
-
-        fs::write(&config_path, valid_config()).expect("failed to write test configuration");
-
-        let config = RuntimeConfig::load(&config_path).expect("configuration should load");
-
-        assert_eq!(
-            config.services["users"].component,
-            test_dir.join("users.wasm")
-        );
-
-        assert_eq!(
-            config.services["orders"].component,
-            test_dir.join("orders.wasm")
-        );
-
-        fs::remove_dir_all(&test_dir).expect("failed to remove test directory");
-    }
-
-    #[test]
-    fn resolves_build_manifest_path_from_config_directory() {
-        let test_dir = create_test_dir();
-        let config_path = test_dir.join("wasm-services.toml");
-
-        let contents = r#"
-[runtime]
-max_services = 1
-
-[services.users]
-component = "users.wasm"
-port = 8081
-enabled = true
-
-[services.users.build]
-manifest = "../guest/Cargo.toml"
-"#;
-
-        fs::write(&config_path, contents).expect("failed to write test configuration");
-
-        let config = RuntimeConfig::load(&config_path).expect("configuration should load");
-
-        assert_eq!(
-            config.services["users"].build.as_ref().unwrap().manifest,
-            test_dir.join("../guest/Cargo.toml")
-        );
-
-        fs::remove_dir_all(&test_dir).expect("failed to remove test directory");
+        let config: RuntimeConfig = toml::from_str(contents).unwrap();
+        assert!(config.validate().is_ok());
     }
 }
+
