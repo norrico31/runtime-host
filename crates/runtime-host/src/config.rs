@@ -16,7 +16,6 @@ fn default_profile() -> String {
     "release".to_string()
 }
 
-
 fn default_gateway_host() -> String {
     "127.0.0.1".to_string()
 }
@@ -41,8 +40,6 @@ pub struct GatewayConfig {
     #[serde(default = "default_gateway_enabled")]
     pub enabled: bool,
 }
-
-
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -225,10 +222,11 @@ impl RuntimeConfig {
 
         if let Some(gateway) = &self.gateway {
             if gateway.enabled && !ports.insert(gateway.port) {
-                return Err(
-                    format!("Gateway port conflicts with a service port: {}", gateway.port)
-                        .into()
-                );
+                return Err(format!(
+                    "Gateway port conflicts with a service port: {}",
+                    gateway.port
+                )
+                .into());
             }
         }
 

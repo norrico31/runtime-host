@@ -1,9 +1,13 @@
-
 mod artifact;
 mod config;
-mod telemetry;
 mod gateway;
+mod network;
+mod telemetry;
 
+use hyper::server::conn::http1;
+use serde_json::json;
+use std::io::Read;
+use std::net::SocketAddr;
 use std::{
     sync::{
         Arc,
@@ -11,10 +15,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use std::io::Read;
-use hyper::server::conn::http1;
-use serde_json::json;
-use std::net::SocketAddr;
 use telemetry::Telemetry;
 use tokio::net::TcpListener;
 use wasmtime::{
@@ -90,19 +90,17 @@ impl Server {
         peer_addr: SocketAddr,
         local_addr: SocketAddr,
     ) -> Result<hyper::Response<HyperOutgoingBody>> {
-
         // GATEWAY ACCESS ENFORCEMENT
-        let provided_token = req.headers()
+        let provided_token = req
+            .headers()
             .get("x-runtime-internal-token")
             .and_then(|value| value.to_str().ok());
 
         if provided_token != Some(self.internal_token.as_str()) {
-            return Ok(
-                hyper::Response::builder()
-                    .status(hyper::StatusCode::FORBIDDEN)
-                    .body(HyperOutgoingBody::default())
-                    .expect("valid 403 response")
-            );
+            return Ok(hyper::Response::builder()
+                .status(hyper::StatusCode::FORBIDDEN)
+                .body(HyperOutgoingBody::default())
+                .expect("valid 403 response"));
         }
 
         let started = Instant::now();
@@ -438,13 +436,13 @@ async fn main() -> Result<()> {
     // INITIALIZE INTERNAL SERVICE ACCESS TOKEN ONCE
     let mut token_bytes = [0u8; 32];
 
-    std::fs::File::open("/dev/urandom")?
-        .read_exact(&mut token_bytes)?;
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut token_bytes)?;
 
     let internal_token = Arc::new(
-        token_bytes.iter()
+        token_bytes
+            .iter()
             .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
+            .collect::<String>(),
     );
 
     println!("Internal service access token initialized.");
@@ -570,35 +568,47 @@ async fn main() -> Result<()> {
         services.push((service_name, listener, server));
     }
 
-    // PHASE 4.1: DEFAULT GATEWAY INITIALIZATION
+    // PHASE 4.1: INTERNAL SERVICE REGISTRY
+
+    let mut service_registry = network::ServiceRegistry::new();
+
+    for (service_name, service_config) in &runtime_config.services {
+        if !service_config.enabled {
+            continue;
+        }
+
+        let address = SocketAddr::from(([127, 0, 0, 1], service_config.port));
+
+        service_registry
+            .register(service_name.clone(), address)
+            .map_err(|err| wasmtime::Error::msg(format!("Service registration failed: {}", err)))?;
+
+        println!(
+            "Service registered: name={} address={}",
+            service_name, address
+        );
+    }
+
+    let service_registry = Arc::new(service_registry);
+
+    println!(
+        "Internal service registry initialized: {} service(s).",
+        service_registry.len()
+    );
+
+    // PHASE 4.2: DEFAULT GATEWAY INITIALIZATION
+
     let gateway_listener = if let Some(gateway_config) = &runtime_config.gateway {
         if gateway_config.enabled {
-            let mut routes = std::collections::BTreeMap::new();
+            let gateway =
+                gateway::Gateway::new(Arc::clone(&service_registry), Arc::clone(&internal_token))?;
 
-            for (service_name, service_config) in &runtime_config.services {
-                if service_config.enabled {
-                    routes.insert(
-                        service_name.clone(),
-                        service_config.port,
-                    );
-                }
-            }
-
-            let gateway = gateway::Gateway::new(
-                routes,
-                Arc::clone(&internal_token),
-            )?;
-
-            let listener = TcpListener::bind((
-                gateway_config.host.as_str(),
-                gateway_config.port,
-            ))
-            .await?;
+            let listener =
+                TcpListener::bind((gateway_config.host.as_str(), gateway_config.port)).await?;
 
             println!(
                 "Default gateway listening on http://{}:{}",
-                gateway_config.host,
-                gateway_config.port
+                gateway_config.host, gateway_config.port
             );
 
             Some((gateway, listener))
@@ -608,6 +618,7 @@ async fn main() -> Result<()> {
         }
     } else {
         println!("Gateway configuration not found. Gateway disabled.");
+
         None
     };
 
@@ -656,4 +667,3 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-
