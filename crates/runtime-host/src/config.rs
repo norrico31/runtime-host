@@ -1,4 +1,3 @@
-
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -266,11 +265,16 @@ impl RuntimeConfig {
             }
 
             if workload.instances == 0 {
-                return Err(format!("Instances must be greater than zero for workload '{name}'").into());
+                return Err(
+                    format!("Instances must be greater than zero for workload '{name}'").into(),
+                );
             }
 
             if workload.resources.memory_limit == 0 {
-                return Err(format!("Memory limit must be greater than zero for workload '{name}'").into());
+                return Err(format!(
+                    "Memory limit must be greater than zero for workload '{name}'"
+                )
+                .into());
             }
 
             match workload.kind {
@@ -284,20 +288,22 @@ impl RuntimeConfig {
                         if build.manifest.is_none() {
                             return Err(format!(
                                 "Cargo build requires 'manifest' for workload '{name}'"
-                            ).into());
+                            )
+                            .into());
                         }
 
                         if build.command.is_some() {
-                            return Err(format!(
-                                "Cargo workload '{name}' cannot define 'command'"
-                            ).into());
+                            return Err(
+                                format!("Cargo workload '{name}' cannot define 'command'").into()
+                            );
                         }
                     }
                     BuildDriver::Command => {
                         if build.command.as_deref().unwrap_or("").trim().is_empty() {
                             return Err(format!(
                                 "Command build requires a non-empty 'command' for workload '{name}'"
-                            ).into());
+                            )
+                            .into());
                         }
                     }
                 }
@@ -319,22 +325,19 @@ impl RuntimeConfig {
             return Err(format!(
                 "Configured instance count ({total_instances}) exceeds runtime.max_instances ({})",
                 self.runtime.max_instances
-            ).into());
+            )
+            .into());
         }
 
         match self.deployment.architecture {
             Architecture::Monolithic => {
                 if monolith_count == 0 || service_count > 0 {
-                    return Err(
-                        "Monolithic architecture requires monolith workloads only".into()
-                    );
+                    return Err("Monolithic architecture requires monolith workloads only".into());
                 }
             }
             Architecture::Microservices => {
                 if service_count == 0 || monolith_count > 0 {
-                    return Err(
-                        "Microservices architecture requires service workloads only".into()
-                    );
+                    return Err("Microservices architecture requires service workloads only".into());
                 }
             }
             Architecture::Hybrid => {
@@ -395,8 +398,7 @@ memory_limit = 268435456
 
     #[test]
     fn rejects_instance_count_above_limit() {
-        let contents = valid_config()
-            .replace("max_instances = 100", "max_instances = 5");
+        let contents = valid_config().replace("max_instances = 100", "max_instances = 5");
         let config: RuntimeConfig = toml::from_str(&contents).unwrap();
         assert!(config.validate().is_err());
     }
@@ -434,4 +436,3 @@ instances = 2
         assert!(config.validate().is_ok());
     }
 }
-

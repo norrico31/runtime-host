@@ -1,4 +1,3 @@
-
 use std::{
     fs::{self, File},
     path::PathBuf,
@@ -7,9 +6,7 @@ use std::{
 
 use wasmtime::{Engine, component::Component};
 
-use crate::config::{
-    BuildConfig, BuildDriver, RuntimeConfig, WorkloadConfig,
-};
+use crate::config::{BuildConfig, BuildDriver, RuntimeConfig, WorkloadConfig};
 
 pub struct PreflightedWorkload {
     pub workload_name: String,
@@ -404,4 +401,3 @@ pub fn preflight_components(
 
     Ok(preflighted)
 }
-

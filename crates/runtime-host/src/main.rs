@@ -1,44 +1,47 @@
 mod artifact;
 mod config;
 mod gateway;
+mod instance;
 mod network;
 mod telemetry;
 
-use hyper::server::conn::http1;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::{Response, body::Incoming, server::conn::http1};
 use serde_json::json;
-use std::io::Read;
-use std::net::SocketAddr;
+
 use std::{
+    io::Read,
+    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
-use telemetry::Telemetry;
-use tokio::net::TcpListener;
-use wasmtime::{
-    Engine, Result, Store,
-    component::{Linker, ResourceTable},
-};
 
-use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
+use instance::InstancePool;
+use telemetry::Telemetry;
+
+use tokio::net::TcpListener;
+
+use wasmtime::{Engine, Result, component::Linker};
+
 use wasmtime_wasi_http::{
-    WasiHttpCtx, WasiHttpCtxView, WasiHttpView,
+    WasiHttpView,
     io::TokioIo,
     p2::{
         bindings::{
             ProxyPre,
-            http::types::{ErrorCode, Scheme},
+            http::types::Scheme,
         },
-        body::HyperOutgoingBody,
     },
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const EPOCH_TICK: Duration = Duration::from_millis(100);
-const WASM_FUEL_BUDGET: u64 = 1_000_000_000;
-const EPOCH_DEADLINE_TICKS: u8 = 40;
+
+type HostResponse = Response<Full<Bytes>>;
 
 fn classify_runtime_error(err: &wasmtime::Error) -> &'static str {
     match err.downcast_ref::<wasmtime::Trap>() {
@@ -49,35 +52,10 @@ fn classify_runtime_error(err: &wasmtime::Error) -> &'static str {
     }
 }
 
-struct HostState {
-    table: ResourceTable,
-    wasi: WasiCtx,
-    http: WasiHttpCtx,
-}
-
-impl WasiView for HostState {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.wasi,
-            table: &mut self.table,
-        }
-    }
-}
-
-impl WasiHttpView for HostState {
-    fn http(&mut self) -> WasiHttpCtxView<'_> {
-        WasiHttpCtxView {
-            ctx: &mut self.http,
-            table: &mut self.table,
-            hooks: Default::default(),
-        }
-    }
-}
-
 struct Server {
-    pre: ProxyPre<HostState>,
+    pool: Arc<InstancePool>,
     requests: AtomicU64,
-    id_sequence: AtomicU64,
+    request_sequence: AtomicU64,
     telemetry: Arc<Telemetry>,
     component: String,
     internal_token: Arc<String>,
@@ -86,20 +64,20 @@ struct Server {
 impl Server {
     async fn handle(
         &self,
-        req: hyper::Request<hyper::body::Incoming>,
+        req: hyper::Request<Incoming>,
         peer_addr: SocketAddr,
         local_addr: SocketAddr,
-    ) -> Result<hyper::Response<HyperOutgoingBody>> {
-        // GATEWAY ACCESS ENFORCEMENT
+    ) -> Result<HostResponse> {
+        // Only the gateway may access internal workload listeners.
         let provided_token = req
             .headers()
             .get("x-runtime-internal-token")
             .and_then(|value| value.to_str().ok());
 
         if provided_token != Some(self.internal_token.as_str()) {
-            return Ok(hyper::Response::builder()
+            return Ok(Response::builder()
                 .status(hyper::StatusCode::FORBIDDEN)
-                .body(HyperOutgoingBody::default())
+                .body(Full::new(Bytes::new()))
                 .expect("valid 403 response"));
         }
 
@@ -107,11 +85,30 @@ impl Server {
         let method = req.method().to_string();
         let path = req.uri().path().to_string();
 
-        let request_sequence = self.id_sequence.fetch_add(1, Ordering::Relaxed);
-        let instance_sequence = self.id_sequence.fetch_add(1, Ordering::Relaxed);
+        let request_number = self.request_sequence.fetch_add(1, Ordering::Relaxed) + 1;
 
-        let request_id = format!("{}-req-{request_sequence:06}", self.component);
-        let instance_id = format!("{}-inst-{instance_sequence:06}", self.component);
+        let request_id = format!("{}-req-{:06}", self.component, request_number);
+
+        let Some(slot) = self.pool.select() else {
+            self.telemetry.record(
+                "request.failed",
+                &self.component,
+                None,
+                Some(&request_id),
+                json!({
+                    "method": method,
+                    "path": path,
+                    "reason": "no_healthy_instances"
+                }),
+            );
+
+            return Ok(Response::builder()
+                .status(hyper::StatusCode::SERVICE_UNAVAILABLE)
+                .body(Full::new(Bytes::new()))
+                .expect("valid 503 response"));
+        };
+
+        let instance_id = slot.id.clone();
 
         self.telemetry.record(
             "request.started",
@@ -128,64 +125,105 @@ impl Server {
             }),
         );
 
-        self.telemetry.record(
-            "instance.created",
-            &self.component,
-            Some(&instance_id),
-            Some(&request_id),
-            json!({ "creation_reason": "http_request" }),
-        );
+        // Lock one persistent instance. Requests assigned to the same
+        // instance are serialized; other instances remain available.
+        let mut runtime = Arc::clone(&slot.runtime).lock_owned().await;
 
-        let mut store = Store::new(
-            self.pre.engine(),
-            HostState {
-                table: ResourceTable::new(),
-                wasi: WasiCtx::builder().inherit_stdio().build(),
-                http: WasiHttpCtx::new(),
-            },
-        );
+        // Reset per-request execution budgets.
+        runtime
+            .store
+            .set_epoch_deadline(instance::EPOCH_DEADLINE_TICKS as u64);
 
-        store.set_epoch_deadline(EPOCH_DEADLINE_TICKS as u64);
-        store.set_fuel(WASM_FUEL_BUDGET)?;
+        runtime.store.set_fuel(instance::WASM_FUEL_BUDGET)?;
 
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-
-        let incoming = store
+        // Create request resources inside the EXISTING Store.
+        let incoming = runtime
+            .store
             .data_mut()
             .http()
             .new_incoming_request(Scheme::Http, req)?;
 
-        let out = store.data_mut().http().new_response_outparam(sender)?;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
 
-        let pre = self.pre.clone();
-        let telemetry = Arc::clone(&self.telemetry);
-        let component = self.component.clone();
-        let task_instance_id = instance_id.clone();
-        let task_request_id = request_id.clone();
+        let out = runtime
+            .store
+            .data_mut()
+            .http()
+            .new_response_outparam(sender)?;
 
         let task = tokio::spawn(async move {
-            let proxy = pre.instantiate_async(&mut store).await?;
+            // Split mutable and immutable borrows of RuntimeInstance.
+            let runtime = &mut *runtime;
 
-            telemetry.record(
-                "instance.ready",
-                &component,
-                Some(&task_instance_id),
-                Some(&task_request_id),
-                json!({}),
-            );
+            let store = &mut runtime.store;
+            let proxy = &runtime.proxy;
 
+            // Execute using the existing persistent Store and Proxy.
             proxy
                 .wasi_http_incoming_handler()
                 .call_handle(store, incoming, out)
-                .await?;
-
-            Ok::<(), wasmtime::Error>(())
+                .await
         });
+        let abort_handle = task.abort_handle();
 
-        let received = tokio::time::timeout(REQUEST_TIMEOUT, receiver).await;
+        let result = tokio::time::timeout(REQUEST_TIMEOUT, async move {
+            let response = match receiver.await {
+                Ok(Ok(response)) => response,
 
-        match received {
-            Ok(Ok(Ok(response))) => {
+                Ok(Err(err)) => {
+                    let _ = task.await;
+
+                    return Err(wasmtime::Error::msg(format!(
+                        "Guest HTTP response error: {err:?}"
+                    )));
+                }
+
+                Err(_) => {
+                    let message = match task.await {
+                        Ok(Ok(())) => "Guest finished without setting an HTTP response".to_string(),
+                        Ok(Err(err)) => err.to_string(),
+                        Err(err) => format!("Guest task failed: {err}"),
+                    };
+
+                    return Err(wasmtime::Error::msg(message));
+                }
+            };
+
+            // Consume the body while the persistent Store is still
+            // exclusively owned by this request.
+            let (parts, body) = response.into_parts();
+
+            let collected = match body.collect().await {
+                Ok(body) => body,
+
+                Err(err) => {
+                    task.abort();
+                    let _ = task.await;
+
+                    return Err(wasmtime::Error::msg(format!(
+                        "Failed to collect guest response body: {err}"
+                    )));
+                }
+            };
+
+            match task.await {
+                Ok(Ok(())) => {}
+
+                Ok(Err(err)) => return Err(err),
+
+                Err(err) => {
+                    return Err(wasmtime::Error::msg(format!(
+                        "Guest task join error: {err}"
+                    )));
+                }
+            }
+
+            Ok(Response::from_parts(parts, Full::new(collected.to_bytes())))
+        })
+        .await;
+
+        match result {
+            Ok(Ok(response)) => {
                 let count = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
                 let status = response.status().as_u16();
                 let duration_us = started.elapsed().as_micros();
@@ -215,108 +253,24 @@ impl Server {
                     }),
                 );
 
-                let telemetry = Arc::clone(&self.telemetry);
-                let component = self.component.clone();
-                let watcher_instance_id = instance_id.clone();
-                let watcher_request_id = request_id.clone();
-
-                tokio::spawn(async move {
-                    match task.await {
-                        Ok(Ok(())) => {}
-
-                        Ok(Err(err)) => {
-                            let event_type = classify_runtime_error(&err);
-
-                            telemetry.record(
-                                event_type,
-                                &component,
-                                Some(&watcher_instance_id),
-                                Some(&watcher_request_id),
-                                json!({ "error": err.to_string() }),
-                            );
-                        }
-
-                        Err(err) => {
-                            telemetry.record(
-                                "runtime.error",
-                                &component,
-                                Some(&watcher_instance_id),
-                                Some(&watcher_request_id),
-                                json!({
-                                    "error": err.to_string(),
-                                    "kind": "task_join_error"
-                                }),
-                            );
-                        }
-                    }
-
-                    telemetry.record(
-                        "instance.terminated",
-                        &component,
-                        Some(&watcher_instance_id),
-                        Some(&watcher_request_id),
-                        json!({ "reason": "request_task_finished" }),
-                    );
-                });
-
                 Ok(response)
             }
 
-            Ok(Ok(Err(err))) => {
-                let message = format!("{err:?}");
-                let event_type = classify_http_error_code(&err);
+            Ok(Err(err)) => {
+                let event_type = classify_runtime_error(&err);
+                let message = err.to_string();
+
+                slot.mark_unhealthy();
 
                 self.telemetry.record(
-                    "request.failed",
+                    event_type,
                     &self.component,
                     Some(&instance_id),
                     Some(&request_id),
                     json!({
-                        "method": method,
-                        "path": path,
-                        "error": message
+                        "error": message,
+                        "instance_health": "unhealthy"
                     }),
-                );
-
-                self.telemetry.record(
-                    event_type,
-                    &self.component,
-                    Some(&instance_id),
-                    Some(&request_id),
-                    json!({ "error": message }),
-                );
-
-                let _ = task.await;
-
-                self.telemetry.record(
-                    "instance.terminated",
-                    &self.component,
-                    Some(&instance_id),
-                    Some(&request_id),
-                    json!({ "reason": "response_error" }),
-                );
-
-                Err(wasmtime::Error::msg(format!("Guest HTTP error: {err:?}")))
-            }
-
-            Ok(Err(_recv_error)) => {
-                let (event_type, message) = match task.await {
-                    Ok(Ok(())) => (
-                        "runtime.error",
-                        "Guest finished without setting an HTTP response".to_string(),
-                    ),
-
-                    Ok(Err(err)) => (classify_runtime_error(&err), err.to_string()),
-
-                    Err(err) => ("runtime.error", format!("Guest task failed: {err}")),
-                };
-
-                self.telemetry.record(
-                    event_type,
-                    &self.component,
-                    Some(&instance_id),
-                    Some(&request_id),
-                    json!({ "error": message }),
                 );
 
                 self.telemetry.record(
@@ -331,20 +285,19 @@ impl Server {
                     }),
                 );
 
-                self.telemetry.record(
-                    "instance.terminated",
-                    &self.component,
-                    Some(&instance_id),
-                    Some(&request_id),
-                    json!({ "reason": "guest_task_failed" }),
-                );
+                eprintln!("Instance {} marked unhealthy: {}", instance_id, message);
 
-                Err(wasmtime::Error::msg(message))
+                Ok(Response::builder()
+                    .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Full::new(Bytes::new()))
+                    .expect("valid 500 response"))
             }
 
-            Err(_elapsed) => {
-                task.abort();
-                let _ = task.await;
+            Err(_) => {
+                // Do not reuse an instance whose execution was cancelled
+                // by the request timeout.
+                abort_handle.abort();
+                slot.mark_unhealthy();
 
                 let duration_us = started.elapsed().as_micros();
 
@@ -358,26 +311,23 @@ impl Server {
                         "path": path,
                         "timeout_ms": REQUEST_TIMEOUT.as_millis(),
                         "duration_us": duration_us,
-                        "reason": "wall_clock_timeout"
+                        "reason": "wall_clock_timeout",
+                        "instance_health": "unhealthy"
                     }),
                 );
 
-                self.telemetry.record(
-                    "instance.terminated",
-                    &self.component,
-                    Some(&instance_id),
-                    Some(&request_id),
-                    json!({ "reason": "request_timeout" }),
+                eprintln!(
+                    "Instance {} marked unhealthy after request timeout.",
+                    instance_id
                 );
 
-                Err(wasmtime::Error::msg("WASM request timed out"))
+                Ok(Response::builder()
+                    .status(hyper::StatusCode::GATEWAY_TIMEOUT)
+                    .body(Full::new(Bytes::new()))
+                    .expect("valid 504 response"))
             }
         }
     }
-}
-
-fn classify_http_error_code(_err: &ErrorCode) -> &'static str {
-    "runtime.error"
 }
 
 async fn serve_listener(listener: TcpListener, server: Arc<Server>) -> Result<()> {
@@ -391,20 +341,20 @@ async fn serve_listener(listener: TcpListener, server: Arc<Server>) -> Result<()
                 let server = Arc::clone(&server);
 
                 async move {
-                    match server.handle(req, peer_addr, local_addr).await {
-                        Ok(response) => Ok::<_, std::io::Error>(response),
+                    let response = match server.handle(req, peer_addr, local_addr).await {
+                        Ok(response) => response,
 
                         Err(err) => {
                             eprintln!("component request failed: {err:#}");
 
-                            let response = hyper::Response::builder()
+                            Response::builder()
                                 .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-                                .body(HyperOutgoingBody::default())
-                                .expect("valid 500 response");
-
-                            Ok(response)
+                                .body(Full::new(Bytes::new()))
+                                .expect("valid 500 response")
                         }
-                    }
+                    };
+
+                    Ok::<_, std::io::Error>(response)
                 }
             });
 
@@ -433,9 +383,8 @@ async fn main() -> Result<()> {
 
     let telemetry = Arc::new(Telemetry::open("telemetry/events.jsonl")?);
 
-    // INITIALIZE INTERNAL SERVICE ACCESS TOKEN ONCE
+    // Initialize internal gateway access token.
     let mut token_bytes = [0u8; 32];
-
     std::fs::File::open("/dev/urandom")?.read_exact(&mut token_bytes)?;
 
     let internal_token = Arc::new(
@@ -459,145 +408,128 @@ async fn main() -> Result<()> {
     artifact::build_configured_artifacts(&runtime_config)?;
 
     // PHASE 2: COMPONENT ARTIFACT PREFLIGHT
-    let preflighted_services = artifact::preflight_components(&engine, &runtime_config)?;
+    let preflighted_workloads = artifact::preflight_components(&engine, &runtime_config)?;
 
     println!(
-        "Artifact preflight passed for {} service(s).",
-        preflighted_services.len()
+        "Artifact preflight passed for {} workload(s).",
+        preflighted_workloads.len()
     );
 
     // PHASE 3: COMPONENT LINKER PREFLIGHT
-    println!("Starting component linker preflight...");
+    let mut prepared_workloads = Vec::new();
 
-    let mut prepared_services = Vec::with_capacity(preflighted_services.len());
-
-    for service in preflighted_services {
+    for workload in preflighted_workloads {
         println!(
-            "Checking component linker compatibility: service={}",
-            service.service_name
+            "Checking component linker compatibility: workload={}",
+            workload.workload_name
         );
 
         let mut linker = Linker::new(&engine);
 
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|err| {
             wasmtime::Error::msg(format!(
-                "Component linker preflight failed for service '{}': \
-                unable to register WASI interfaces: {}",
-                service.service_name, err
+                "WASI linker setup failed for '{}': {}",
+                workload.workload_name, err
             ))
         })?;
 
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).map_err(|err| {
             wasmtime::Error::msg(format!(
-                "Component linker preflight failed for service '{}': \
-                unable to register WASI HTTP interfaces: {}",
-                service.service_name, err
+                "WASI HTTP linker setup failed for '{}': {}",
+                workload.workload_name, err
             ))
         })?;
 
-        let instance_pre = linker.instantiate_pre(&service.component).map_err(|err| {
+        let instance_pre = linker.instantiate_pre(&workload.component).map_err(|err| {
             wasmtime::Error::msg(format!(
-                "Component linker preflight failed for service '{}': \
-                component imports are incompatible with the host linker: {}",
-                service.service_name, err
+                "Component linker preflight failed for '{}': {}",
+                workload.workload_name, err
             ))
         })?;
 
         let pre = ProxyPre::new(instance_pre).map_err(|err| {
             wasmtime::Error::msg(format!(
-                "Component linker preflight failed for service '{}': {}",
-                service.service_name, err
+                "Proxy pre-instantiation failed for '{}': {}",
+                workload.workload_name, err
             ))
         })?;
 
-        println!(
-            "Component linker preflight passed: service={}",
-            service.service_name
-        );
-
-        prepared_services.push((
-            service.service_name,
-            service.component_path,
-            service.port,
+        prepared_workloads.push((
+            workload.workload_name,
+            workload.artifact_path,
+            workload.instances,
             pre,
         ));
     }
 
     println!(
-        "Component linker preflight completed successfully: \
-        {} service(s) validated.",
-        prepared_services.len()
+        "Component linker preflight completed: {} workload(s).",
+        prepared_workloads.len()
     );
 
-    // PHASE 4: SERVICE PREPARATION AND LISTENER BINDING
-    let mut services: Vec<(String, TcpListener, Arc<Server>)> =
-        Vec::with_capacity(prepared_services.len());
+    // PHASE 4: CREATE PERSISTENT INSTANCE POOLS AND LISTENERS
+    let mut services = Vec::new();
+    let mut service_registry = network::ServiceRegistry::new();
 
-    for (service_name, component_path, port, pre) in prepared_services {
-        println!("Preparing service: name={} port={}", service_name, port);
+    for (workload_name, artifact_path, instance_count, pre) in prepared_workloads {
+        println!(
+            "Initializing workload '{}' with {} persistent instance(s).",
+            workload_name, instance_count
+        );
+
+        let pool = Arc::new(
+            InstancePool::create(&pre, &workload_name, instance_count, Arc::clone(&telemetry))
+                .await?,
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
 
         let server = Arc::new(Server {
-            pre,
+            pool: Arc::clone(&pool),
             requests: AtomicU64::new(0),
-            id_sequence: AtomicU64::new(1),
+            request_sequence: AtomicU64::new(1),
             telemetry: Arc::clone(&telemetry),
-            component: service_name.clone(),
+            component: workload_name.clone(),
             internal_token: Arc::clone(&internal_token),
         });
 
-        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+        service_registry
+            .register(workload_name.clone(), address)
+            .map_err(|err| wasmtime::Error::msg(format!("Workload registration failed: {err}")))?;
 
         telemetry.record(
             "runtime.started",
-            &service_name,
+            &workload_name,
             None,
             None,
             json!({
                 "host": "runtime-host",
                 "wasmtime_version": "50",
-                "component_path": component_path.display().to_string(),
-                "port": port
+                "artifact_path": artifact_path.display().to_string(),
+                "instance_count": pool.len(),
+                "listener_address": address.to_string()
             }),
         );
 
         println!(
-            "Service '{}' listening on http://127.0.0.1:{}",
-            service_name, port
+            "Workload '{}' ready: listener={} instances={}",
+            workload_name,
+            address,
+            pool.len()
         );
 
-        services.push((service_name, listener, server));
-    }
-
-    // PHASE 4.1: INTERNAL SERVICE REGISTRY
-
-    let mut service_registry = network::ServiceRegistry::new();
-
-    for (service_name, service_config) in &runtime_config.services {
-        if !service_config.enabled {
-            continue;
-        }
-
-        let address = SocketAddr::from(([127, 0, 0, 1], service_config.port));
-
-        service_registry
-            .register(service_name.clone(), address)
-            .map_err(|err| wasmtime::Error::msg(format!("Service registration failed: {}", err)))?;
-
-        println!(
-            "Service registered: name={} address={}",
-            service_name, address
-        );
+        services.push((workload_name, listener, server));
     }
 
     let service_registry = Arc::new(service_registry);
 
     println!(
-        "Internal service registry initialized: {} service(s).",
+        "Internal service registry initialized: {} workload(s).",
         service_registry.len()
     );
 
-    // PHASE 4.2: DEFAULT GATEWAY INITIALIZATION
-
+    // PHASE 5: DEFAULT GATEWAY
     let gateway_listener = if let Some(gateway_config) = &runtime_config.gateway {
         if gateway_config.enabled {
             let gateway =
@@ -618,11 +550,10 @@ async fn main() -> Result<()> {
         }
     } else {
         println!("Gateway configuration not found. Gateway disabled.");
-
         None
     };
 
-    // PHASE 5: START RUNTIME EPOCH TICKER
+    // PHASE 6: WASMTIME EPOCH TICKER
     let epoch_engine = engine.clone();
 
     tokio::spawn(async move {
@@ -634,16 +565,16 @@ async fn main() -> Result<()> {
         }
     });
 
-    // PHASE 6: START SERVICE LISTENERS
-    for (service_name, listener, server) in services {
+    // PHASE 7: START INTERNAL WORKLOAD LISTENERS
+    for (workload_name, listener, server) in services {
         tokio::spawn(async move {
             if let Err(err) = serve_listener(listener, server).await {
-                eprintln!("Service '{}' stopped: {err:#}", service_name);
+                eprintln!("Workload '{}' listener stopped: {err:#}", workload_name);
             }
         });
     }
 
-    // PHASE 6.1: START DEFAULT GATEWAY
+    // PHASE 8: START DEFAULT GATEWAY
     if let Some((gateway, listener)) = gateway_listener {
         tokio::spawn(async move {
             if let Err(err) = gateway::serve(gateway, listener).await {
@@ -652,15 +583,23 @@ async fn main() -> Result<()> {
         });
     }
 
-    let active_services = runtime_config
-        .services
+    let active_workloads = runtime_config
+        .workloads
         .values()
-        .filter(|service| service.enabled)
+        .filter(|workload| workload.enabled)
         .count();
+
+    let total_instances: usize = runtime_config
+        .workloads
+        .values()
+        .filter(|workload| workload.enabled)
+        .map(|workload| workload.instances)
+        .sum();
 
     println!("==========================================");
     println!("Runtime host initialized successfully.");
-    println!("Active services: {}", active_services);
+    println!("Active workloads: {}", active_workloads);
+    println!("Persistent instances: {}", total_instances);
     println!("==========================================");
 
     std::future::pending::<()>().await;
